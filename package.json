@@ -1,0 +1,16 @@
+{
+  "name": "snipes-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Live snipes dashboard: Netlify + Discord trade data",
+  "scripts": {
+    "dev": "netlify dev",
+    "build": "echo Static site; exit 0"
+  },
+  "dependencies": {
+    "discord.js": "^14.24.0"
+  },
+  "devDependencies": {
+    "netlify-cli": "^17.38.0"
+  }
+}
