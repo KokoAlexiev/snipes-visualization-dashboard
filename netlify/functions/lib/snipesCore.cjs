@@ -442,15 +442,20 @@ async function fetchMessages(client, daysBack = 7, channelId = CHANNEL_ID) {
   return events;
 }
 
+/** create-trades rows with markup ≤ 3% (same rule as fetchMarketFeedUnder3). */
+function filterCreateTradesMarkupAtMost3(raw) {
+  return raw.filter((e) => {
+    const pct = e.markupPercent != null ? e.markupPercent : (e.markup && parseFloat(String(e.markup).replace(/[^0-9.-]/g, '')));
+    return typeof pct === 'number' && !isNaN(pct) && pct <= 3;
+  });
+}
+
 /**
  * Fetch create-trades messages. Returns { under3, all } — all messages for lookup enrichment, under3 for missed-snipe logic.
  */
 async function fetchMarketFeedUnder3(client, daysBack = 7) {
   const raw = await fetchMessages(client, daysBack, CREATE_TRADES_CHANNEL_ID);
-  const under3 = raw.filter((e) => {
-    const pct = e.markupPercent != null ? e.markupPercent : (e.markup && parseFloat(String(e.markup).replace(/[^0-9.-]/g, '')));
-    return typeof pct === 'number' && !isNaN(pct) && pct <= 3;
-  });
+  const under3 = filterCreateTradesMarkupAtMost3(raw);
   console.log(`📊 create-trades: ${raw.length} messages with trade ID, ${under3.length} with markup ≤3%`);
   return { under3, all: raw };
 }
@@ -2384,8 +2389,12 @@ async function getHtml(daysBack) {
   await client.login(DISCORD_BOT_TOKEN);
 
   try {
-    const events = await fetchMessages(client, days, TRADE_SUCCESS_CHANNEL_ID);
-    const { under3: marketFeedUnder3, all: allCreateTrades } = await fetchMarketFeedUnder3(client, days);
+    // Both channels paginate independently — run in parallel to cut wall time roughly in half.
+    const [events, allCreateTrades] = await Promise.all([
+      fetchMessages(client, days, TRADE_SUCCESS_CHANNEL_ID),
+      fetchMessages(client, days, CREATE_TRADES_CHANNEL_ID)
+    ]);
+    const marketFeedUnder3 = filterCreateTradesMarkupAtMost3(allCreateTrades);
     const gotIds = new Set(events.map((e) => (e.tradeId || '').trim()).filter(Boolean));
     const missedSnipes = marketFeedUnder3.filter((e) => {
       const tid = (e.tradeId || '').trim();

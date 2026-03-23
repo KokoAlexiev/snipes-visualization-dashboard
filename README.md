@@ -38,7 +38,13 @@ Functions are picked up from `netlify/functions` via `netlify.toml`.
 
 ### Timeouts
 
-Discord history for many days can take longer than the default **10s** function limit on the free tier. If requests time out, shorten the range or use a higher function timeout on a paid Netlify plan.
+Fetching Discord history (two channels, hundreds/thousands of messages) can run for **minutes** in the worst case. This project sets **`[functions.snipes-html] timeout = 900`** (seconds) in `netlify.toml`. Netlify will still **cap** that to whatever your plan allows for synchronous functions (check **Site configuration → Functions** in the dashboard and [current limits](https://docs.netlify.com/functions/overview/#default-deployment-options-for-functions)).
+
+Local **`netlify dev`** previously defaulted to ~**30s** per invocation; it should pick up the same `netlify.toml` timeout so the handler can finish.
+
+The handler also **fetches trade-success and create-trades in parallel** to reduce wall time.
+
+If you still hit limits on long ranges, use a smaller slider value or move the fetch to a long-running host (VPS, Railway, etc.); synchronous browser requests cannot stay open forever.
 
 ## Security
 

@@ -5,6 +5,11 @@
 [functions]
   node_bundler = "esbuild"
 
+# Discord backfill can take minutes on large windows. Netlify caps this to your plan’s max
+# (often 60s+ on current tiers; lower plans may clamp further). Local `netlify dev` honors this too.
+[functions.snipes-html]
+  timeout = 900
+
 [[redirects]]
   from = "/api/snipes"
   to = "/.netlify/functions/snipes-html"
