@@ -11,6 +11,8 @@
       --text: #c0caf5;
       --accent: #7aa2f7;
       --muted: #565f89;
+      --danger: #f7768e;
+      --border: #3b4261;
     }
     * { box-sizing: border-box; }
     body {
@@ -26,38 +28,87 @@
       min-height: 100vh;
     }
     header {
-      padding: 1rem 1.25rem;
+      padding: 0.75rem 1.25rem;
       background: var(--panel);
-      border-bottom: 1px solid #3b4261;
+      border-bottom: 1px solid var(--border);
       display: flex;
       flex-wrap: wrap;
       align-items: center;
-      gap: 1rem 1.5rem;
+      gap: 0.75rem 1.5rem;
     }
     h1 {
       margin: 0;
-      font-size: 1.15rem;
+      font-size: 1.1rem;
       font-weight: 600;
+      white-space: nowrap;
     }
     .controls {
       display: flex;
+      flex-wrap: wrap;
+      align-items: flex-end;
+      gap: 0.5rem 1rem;
+    }
+    .field {
+      display: flex;
       flex-direction: column;
-      gap: 0.35rem;
-      flex: 1;
-      min-width: 220px;
-      max-width: 420px;
+      gap: 0.25rem;
     }
-    .controls label {
-      font-size: 0.85rem;
+    .field label {
+      font-size: 0.75rem;
       color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
     }
-    #rangeLabel {
+    input[type="date"] {
+      background: var(--bg);
       color: var(--text);
-      font-weight: 500;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 0.4rem 0.6rem;
+      font-size: 0.9rem;
+      font-family: inherit;
+      cursor: pointer;
+      outline: none;
+      transition: border-color 0.2s;
     }
-    input[type="range"] {
-      width: 100%;
-      accent-color: var(--accent);
+    input[type="date"]:hover,
+    input[type="date"]:focus {
+      border-color: var(--accent);
+    }
+    /* Chrome date-picker colorscheme */
+    input[type="date"]::-webkit-calendar-picker-indicator {
+      filter: invert(0.7);
+      cursor: pointer;
+    }
+    button.load-btn {
+      background: var(--accent);
+      color: var(--bg);
+      border: none;
+      border-radius: 5px;
+      padding: 0.42rem 1rem;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      align-self: flex-end;
+      transition: opacity 0.15s;
+    }
+    button.load-btn:hover { opacity: 0.85; }
+    .cache-badge {
+      font-size: 0.72rem;
+      padding: 0.18rem 0.45rem;
+      border-radius: 3px;
+      font-weight: 600;
+      align-self: flex-end;
+      margin-bottom: 0.45rem;
+      display: none;
+    }
+    .cache-badge.hit  { background: #9ece6a22; color: #9ece6a; border: 1px solid #9ece6a55; display: inline-block; }
+    .cache-badge.miss { background: #f7768e22; color: #f7768e; border: 1px solid #f7768e55; display: inline-block; }
+    .error-msg {
+      font-size: 0.82rem;
+      color: var(--danger);
+      align-self: flex-end;
+      margin-bottom: 0.4rem;
     }
     .frame-wrap {
       flex: 1;
@@ -67,7 +118,7 @@
     iframe#dash {
       width: 100%;
       height: 100%;
-      min-height: calc(100vh - 88px);
+      min-height: calc(100vh - 72px);
       border: 0;
       display: block;
       background: #fff;
@@ -98,12 +149,14 @@
       border-radius: 50%;
       animation: spin 0.75s linear infinite;
     }
-    @keyframes spin {
-      to { transform: rotate(360deg); }
-    }
+    @keyframes spin { to { transform: rotate(360deg); } }
     .loading-text {
       font-size: 0.9rem;
       color: var(--muted);
+    }
+    .loading-range {
+      font-size: 0.8rem;
+      color: var(--accent);
     }
   </style>
 </head>
@@ -112,70 +165,131 @@
     <header>
       <h1>Snipes by hostname</h1>
       <div class="controls">
-        <label for="daysSlider">Time range: <span id="rangeLabel">Last 24 hours (1 day)</span></label>
-        <input type="range" id="daysSlider" min="1" max="30" value="1" />
+        <div class="field">
+          <label for="startDate">Start date</label>
+          <input type="date" id="startDate" />
+        </div>
+        <div class="field">
+          <label for="endDate">End date</label>
+          <input type="date" id="endDate" />
+        </div>
+        <button class="load-btn" id="loadBtn">Load</button>
+        <span class="cache-badge" id="cacheBadge"></span>
+        <span class="error-msg" id="errorMsg"></span>
       </div>
     </header>
     <div class="frame-wrap">
       <div id="loading" class="loading-overlay show" aria-live="polite" aria-busy="true">
         <div class="spinner" role="presentation"></div>
         <div class="loading-text">Loading Discord data…</div>
+        <div class="loading-range" id="loadingRange"></div>
       </div>
-      <iframe id="dash" title="Snipes charts" sandbox="allow-scripts allow-same-origin allow-downloads"></iframe>
+      <iframe id="dash" title="Snipes charts" sandbox="allow-scripts allow-downloads"></iframe>
     </div>
   </div>
   <script>
     (function () {
-      var slider = document.getElementById('daysSlider');
-      var label = document.getElementById('rangeLabel');
-      var dash = document.getElementById('dash');
-      var loading = document.getElementById('loading');
+      var startInput  = document.getElementById('startDate');
+      var endInput    = document.getElementById('endDate');
+      var loadBtn     = document.getElementById('loadBtn');
+      var dash        = document.getElementById('dash');
+      var loading     = document.getElementById('loading');
+      var cacheBadge  = document.getElementById('cacheBadge');
+      var errorMsg    = document.getElementById('errorMsg');
+      var loadingRange = document.getElementById('loadingRange');
 
-      function fnBase() {
-        return '/.netlify/functions/snipes-html';
+      var MAX_SPAN_DAYS = 30;
+
+      /* Return today as a UTC YYYY-MM-DD string */
+      function todayUTC() {
+        return new Date().toISOString().slice(0, 10);
       }
 
-      function describeDays(n) {
-        var d = parseInt(n, 10) || 1;
-        if (d === 1) return 'Last 24 hours (1 day)';
-        return 'Last ' + d + ' days';
+      /* Return a UTC date string N days before a given YYYY-MM-DD */
+      function offsetDate(dateStr, daysBack) {
+        var d = new Date(dateStr + 'T00:00:00Z');
+        d.setUTCDate(d.getUTCDate() - daysBack);
+        return d.toISOString().slice(0, 10);
       }
 
-      function setLoading(on) {
+      /* Validate inputs; return error string or null */
+      function validate(start, end) {
+        if (!start || !end) return 'Both dates are required';
+        if (start > end)    return 'Start must be on or before end date';
+        var s = new Date(start + 'T00:00:00Z');
+        var e = new Date(end   + 'T00:00:00Z');
+        var span = Math.round((e - s) / 86400000) + 1;
+        if (span > MAX_SPAN_DAYS) return 'Range too wide — max ' + MAX_SPAN_DAYS + ' days';
+        return null;
+      }
+
+      function setLoading(on, start, end) {
         loading.classList.toggle('show', on);
         loading.setAttribute('aria-busy', on ? 'true' : 'false');
+        loadingRange.textContent = on && start && end ? start + ' → ' + end : '';
+        if (on) {
+          cacheBadge.className = 'cache-badge';
+          cacheBadge.textContent = '';
+        }
+      }
+
+      function showError(msg) {
+        errorMsg.textContent = msg || '';
       }
 
       var debounceId = null;
-      function loadDays(days, immediate) {
-        var d = Math.min(30, Math.max(1, parseInt(days, 10) || 1));
-        function run() {
-          setLoading(true);
-          var url = fnBase() + '?days=' + encodeURIComponent(String(d)) + '&_=' + Date.now();
-          dash.onload = function () {
+      function doLoad() {
+        if (debounceId) clearTimeout(debounceId);
+        var start = startInput.value;
+        var end   = endInput.value;
+        var err   = validate(start, end);
+        if (err) { showError(err); return; }
+        showError('');
+        setLoading(true, start, end);
+
+        var url = '/.netlify/functions/snipes-html?start=' + encodeURIComponent(start) +
+                  '&end=' + encodeURIComponent(end) + '&_=' + Date.now();
+
+        // Use fetch so we can inspect X-Snipes-Cache header, then inject via srcdoc
+        fetch(url)
+          .then(function (res) {
+            var hit = res.headers.get('X-Snipes-Cache');
+            cacheBadge.className = 'cache-badge ' + (hit === 'HIT' ? 'hit' : 'miss');
+            cacheBadge.textContent = hit === 'HIT' ? 'Cached' : 'Live fetch';
+            return res.text();
+          })
+          .then(function (html) {
+            dash.onload = function () { setLoading(false); };
+            dash.onerror = function () { setLoading(false); };
+            dash.srcdoc = html;
+          })
+          .catch(function (fetchErr) {
             setLoading(false);
-          };
-          dash.onerror = function () {
-            setLoading(false);
-          };
-          dash.src = url;
-        }
-        if (immediate) {
-          if (debounceId) clearTimeout(debounceId);
-          run();
-        } else {
-          if (debounceId) clearTimeout(debounceId);
-          debounceId = setTimeout(run, 450);
-        }
+            showError('Fetch failed: ' + (fetchErr && fetchErr.message));
+          });
       }
 
-      slider.addEventListener('input', function () {
-        label.textContent = describeDays(slider.value);
-        loadDays(slider.value, false);
-      });
+      /* Debounce for date input changes — don't fire on every keystroke */
+      function scheduleLoad() {
+        if (debounceId) clearTimeout(debounceId);
+        debounceId = setTimeout(doLoad, 600);
+      }
 
-      label.textContent = describeDays(slider.value);
-      loadDays(slider.value, true);
+      loadBtn.addEventListener('click', doLoad);
+      startInput.addEventListener('change', scheduleLoad);
+      endInput.addEventListener('change', scheduleLoad);
+
+      /* Set defaults: start = yesterday UTC, end = today UTC (≈ last 24h as calendar window) */
+      var today = todayUTC();
+      endInput.value   = today;
+      startInput.value = offsetDate(today, 1);
+
+      /* Cap max date to today */
+      startInput.max = today;
+      endInput.max   = today;
+
+      /* Initial auto-load */
+      doLoad();
     })();
   </script>
 </body>

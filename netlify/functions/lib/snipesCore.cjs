@@ -384,21 +384,33 @@ function parseMarketFeedMessage(message) {
 }
 
 /**
- * Fetch messages from a Discord channel
+ * Fetch messages from a Discord channel (legacy rolling-window helper, still used by main CLI).
  */
 async function fetchMessages(client, daysBack = 7, channelId = CHANNEL_ID) {
+  const endMs   = Date.now();
+  const startMs = endMs - (daysBack * 24 * 60 * 60 * 1000);
+  return fetchMessagesInRange(client, startMs, endMs, channelId);
+}
+
+/**
+ * Fetch messages from a Discord channel that fall inside [rangeStartMs, rangeEndMs].
+ * Pagination stops when we go older than rangeStartMs.
+ * Returns an array of parsed event objects.
+ */
+async function fetchMessagesInRange(client, rangeStartMs, rangeEndMs, channelId = CHANNEL_ID) {
   const guild = await client.guilds.fetch(GUILD_ID);
   const channel = await guild.channels.fetch(channelId);
-  
+
   if (!channel) {
     throw new Error(`Channel ${channelId} not found`);
   }
 
   const events = [];
-  const cutoffTime = Date.now() - (daysBack * 24 * 60 * 60 * 1000);
+  const cutoffTime = rangeStartMs;
   const parseFn = channelId === TRADE_SUCCESS_CHANNEL_ID ? parseTradeMessage : parseMarketFeedMessage;
 
-  console.log(`📥 Fetching messages from channel ${channelId} (last ${daysBack} days)...`);
+  const rangeLabel = `${new Date(rangeStartMs).toISOString().slice(0,10)}..${new Date(rangeEndMs).toISOString().slice(0,10)}`;
+  console.log(`📥 Fetching messages from channel ${channelId} (${rangeLabel})...`);
 
   let lastMessageId = null;
   let fetchedCount = 0;
@@ -423,6 +435,8 @@ async function fetchMessages(client, daysBack = 7, channelId = CHANNEL_ID) {
         hasMore = false;
         break;
       }
+      // Skip messages newer than range end (only relevant when range ends before now)
+      if (message.createdTimestamp > rangeEndMs) continue;
       const event = parseFn(message);
       if (event) {
         events.push(event);
@@ -2369,14 +2383,33 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
 }
 
 /**
- * Build full dashboard HTML for the given day window (1 = last 24h, 30 = last 30 days).
- * Used by Netlify and optional local CLI.
+ * Build full dashboard HTML for an explicit UTC calendar date range.
+ * startDateStr / endDateStr: 'YYYY-MM-DD'
+ * supabaseClient: optional Supabase client (from snipesCache.cjs) — pass null to skip caching.
+ * Returns { html, cacheHit }
  */
-async function getHtml(daysBack) {
+async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient) {
   if (!DISCORD_BOT_TOKEN) {
     throw new Error('Missing DISCORD_BOT_TOKEN environment variable');
   }
-  const days = Math.min(30, Math.max(1, Math.floor(Number(daysBack)) || 1));
+
+  const {
+    dateStringToRange,
+    isFullyInPast,
+    loadCache,
+    upsertCache,
+    getChannelWatermark
+  } = require('./snipesCache.cjs');
+
+  const { startMs: chartStartMs, endMs: chartEndMs } = dateStringToRange(startDateStr);
+  const { endMs: endDayMs }  = dateStringToRange(endDateStr);
+  const rangeStartMs = chartStartMs;
+  const rangeEndMs   = endDayMs;
+
+  // Days count for generateHTML label
+  const [sy, sm, sd] = startDateStr.split('-').map(Number);
+  const [ey, em, ed] = endDateStr.split('-').map(Number);
+  const daysBack = Math.round((Date.UTC(ey, em-1, ed) - Date.UTC(sy, sm-1, sd)) / 86400000) + 1;
 
   const client = new Client({
     intents: [
@@ -2389,10 +2422,53 @@ async function getHtml(daysBack) {
   await client.login(DISCORD_BOT_TOKEN);
 
   try {
-    // Both channels paginate independently — run in parallel to cut wall time roughly in half.
+    // --- Cheap watermark check (skip entirely for past-only ranges) ---
+    let wmTradeSuccess = '';
+    let wmCreateTrades = '';
+    const rangeIsPast = isFullyInPast(endDateStr);
+
+    if (!rangeIsPast) {
+      // Parallel watermark fetch from both channels
+      const guild = await client.guilds.fetch(GUILD_ID);
+      const [tsChan, ctChan] = await Promise.all([
+        guild.channels.fetch(TRADE_SUCCESS_CHANNEL_ID),
+        guild.channels.fetch(CREATE_TRADES_CHANNEL_ID)
+      ]);
+      [wmTradeSuccess, wmCreateTrades] = await Promise.all([
+        getChannelWatermark(tsChan),
+        getChannelWatermark(ctChan)
+      ]);
+    }
+
+    // --- Try cache ---
+    if (supabaseClient) {
+      const cached = await loadCache(supabaseClient, startDateStr, endDateStr);
+      if (cached) {
+        const isHit = rangeIsPast || (
+          cached.watermarkTradeSuccess === wmTradeSuccess &&
+          cached.watermarkCreateTrades === wmCreateTrades
+        );
+        if (isHit) {
+          console.log(`[cache] HIT ${startDateStr}..${endDateStr}`);
+          const { events, missedSnipes, marketFeedUnder3, allCreateTrades, chartStartMs: cSt, chartEndMs: cEn } = cached.payload;
+          const html = generateHTML(events, daysBack, missedSnipes, {
+            startTime: cSt,
+            endTime:   cEn,
+            channelBUnder3: marketFeedUnder3,
+            allCreateTrades: allCreateTrades
+          });
+          return { html, cacheHit: true };
+        }
+        console.log(`[cache] STALE ${startDateStr}..${endDateStr} (watermarks changed)`);
+      } else {
+        console.log(`[cache] MISS ${startDateStr}..${endDateStr}`);
+      }
+    }
+
+    // --- Full Discord fetch ---
     const [events, allCreateTrades] = await Promise.all([
-      fetchMessages(client, days, TRADE_SUCCESS_CHANNEL_ID),
-      fetchMessages(client, days, CREATE_TRADES_CHANNEL_ID)
+      fetchMessagesInRange(client, rangeStartMs, rangeEndMs, TRADE_SUCCESS_CHANNEL_ID),
+      fetchMessagesInRange(client, rangeStartMs, rangeEndMs, CREATE_TRADES_CHANNEL_ID)
     ]);
     const marketFeedUnder3 = filterCreateTradesMarkupAtMost3(allCreateTrades);
     const gotIds = new Set(events.map((e) => (e.tradeId || '').trim()).filter(Boolean));
@@ -2405,17 +2481,53 @@ async function getHtml(daysBack) {
       return true;
     });
 
-    const chartEndTime = Date.now();
-    const chartStartTime = chartEndTime - (days * 24 * 60 * 60 * 1000);
-    return generateHTML(events, days, missedSnipes, {
-      startTime: chartStartTime,
-      endTime: chartEndTime,
+    // --- Upsert cache ---
+    if (supabaseClient) {
+      // Get watermarks for current-day ranges if not fetched yet
+      if (rangeIsPast) {
+        try {
+          const guild = await client.guilds.fetch(GUILD_ID);
+          const [tsChan, ctChan] = await Promise.all([
+            guild.channels.fetch(TRADE_SUCCESS_CHANNEL_ID),
+            guild.channels.fetch(CREATE_TRADES_CHANNEL_ID)
+          ]);
+          [wmTradeSuccess, wmCreateTrades] = await Promise.all([
+            getChannelWatermark(tsChan),
+            getChannelWatermark(ctChan)
+          ]);
+        } catch (_) {}
+      }
+      await upsertCache(supabaseClient, startDateStr, endDateStr, {
+        events, missedSnipes, marketFeedUnder3, allCreateTrades,
+        chartStartMs: rangeStartMs,
+        chartEndMs:   rangeEndMs
+      }, wmTradeSuccess, wmCreateTrades);
+    }
+
+    const html = generateHTML(events, daysBack, missedSnipes, {
+      startTime: rangeStartMs,
+      endTime:   rangeEndMs,
       channelBUnder3: marketFeedUnder3,
       allCreateTrades: allCreateTrades
     });
+    return { html, cacheHit: false };
   } finally {
     await client.destroy().catch(() => {});
   }
+}
+
+/**
+ * Legacy helper: rolling N-day window from now.
+ * Converts to a date range and delegates to getHtmlForDateRange.
+ */
+async function getHtml(daysBack) {
+  const days = Math.min(30, Math.max(1, Math.floor(Number(daysBack)) || 1));
+  const now   = new Date();
+  const endDateStr   = now.toISOString().slice(0, 10);
+  const startUTC     = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - (days - 1)));
+  const startDateStr = startUTC.toISOString().slice(0, 10);
+  const { html } = await getHtmlForDateRange(startDateStr, endDateStr, null);
+  return html;
 }
 
 /**
@@ -2557,8 +2669,10 @@ module.exports = {
   getMessageContent,
   isBlacklisted,
   fetchMessages,
+  fetchMessagesInRange,
   fetchMarketFeedUnder3,
   generateHTML,
-  getHtml
+  getHtml,
+  getHtmlForDateRange
 };
 
