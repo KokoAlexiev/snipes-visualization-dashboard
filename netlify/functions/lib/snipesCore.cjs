@@ -2820,13 +2820,11 @@ async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient) {
         if (isHit) {
           console.log(`[cache] HIT ${startDateStr}..${endDateStr}`);
           const { events, missedSnipes, marketFeedUnder3, allCreateTrades, chartStartMs: cSt, chartEndMs: cEn } = cached.payload;
-          // Re-compute ineligible/blacklist splits from cached data (they aren't stored in cache)
-          let cacheHitBlacklistNameSet = new Set();
-          try {
-            if (supabaseClient) cacheHitBlacklistNameSet = await fetchBlacklistItemNameSet(supabaseClient);
-          } catch (_) {}
-          let cacheHitHeartbeats = [];
-          try { cacheHitHeartbeats = await fetchSnipesHeartbeatSnapshots(client, daysBack); } catch (_) {}
+          // Re-compute ineligible/blacklist splits from cached data (in parallel)
+          const [cacheHitHeartbeats, cacheHitBlacklistNameSet] = await Promise.all([
+            fetchSnipesHeartbeatSnapshots(client, daysBack).catch(() => []),
+            (supabaseClient ? fetchBlacklistItemNameSet(supabaseClient) : Promise.resolve(new Set())).catch(() => new Set())
+          ]);
           const cacheHitHbSorted = [...cacheHitHeartbeats].sort((a, b) => a.timestamp - b.timestamp);
           const gotIds = new Set(events.map((e) => (e.tradeId || '').trim()).filter(Boolean));
           const cacheHitCandidates = (marketFeedUnder3 || []).filter((e) => {
@@ -2863,10 +2861,18 @@ async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient) {
       }
     }
 
-    // --- Full Discord fetch ---
-    const [events, allCreateTrades] = await Promise.all([
+    // --- Full Discord fetch (all 3 channels + Supabase blacklist in parallel) ---
+    const [events, allCreateTrades, heartbeatSnapshots, supabaseBlacklistNameSet] = await Promise.all([
       fetchMessagesInRange(client, rangeStartMs, rangeEndMs, TRADE_SUCCESS_CHANNEL_ID),
-      fetchMessagesInRange(client, rangeStartMs, rangeEndMs, CREATE_TRADES_CHANNEL_ID)
+      fetchMessagesInRange(client, rangeStartMs, rangeEndMs, CREATE_TRADES_CHANNEL_ID),
+      fetchSnipesHeartbeatSnapshots(client, daysBack).catch(err => {
+        console.warn('⚠️ Snipes console heartbeats unavailable (not-eligible split disabled):', err.message || err);
+        return [];
+      }),
+      (supabaseClient ? fetchBlacklistItemNameSet(supabaseClient) : Promise.resolve(new Set())).catch(err => {
+        console.warn('⚠️ Supabase blacklist fetch failed:', err.message || err);
+        return new Set();
+      })
     ]);
     const marketFeedUnder3 = filterCreateTradesMarkupAtMost3(allCreateTrades);
     const gotIds = new Set(events.map((e) => (e.tradeId || '').trim()).filter(Boolean));
@@ -2878,18 +2884,6 @@ async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient) {
       if (price != null && (price < MISSED_PRICE_MIN || price > MISSED_PRICE_MAX)) return false;
       return true;
     });
-    let supabaseBlacklistNameSet = new Set();
-    try {
-      if (supabaseClient) supabaseBlacklistNameSet = await fetchBlacklistItemNameSet(supabaseClient);
-    } catch (err) {
-      console.warn('⚠️ Supabase blacklist fetch failed:', err.message || err);
-    }
-    let heartbeatSnapshots = [];
-    try {
-      heartbeatSnapshots = await fetchSnipesHeartbeatSnapshots(client, daysBack);
-    } catch (err) {
-      console.warn('⚠️ Snipes console heartbeats unavailable (not-eligible split disabled):', err.message || err);
-    }
     const hbSorted = [...heartbeatSnapshots].sort((a, b) => a.timestamp - b.timestamp);
     const missedSnipes = [], ineligibleSnipes = [], supabaseBlacklistSnipes = [];
     for (const e of candidateMissed) {
