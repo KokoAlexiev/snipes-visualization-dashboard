@@ -5,7 +5,8 @@
   "description": "Live snipes dashboard: Netlify + Discord trade data",
   "scripts": {
     "dev": "netlify dev",
-    "build": "echo Static site; exit 0"
+    "build": "echo Static site; exit 0",
+    "generate-chart": "node visualizations/generate_snipes_chart.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.100.0",

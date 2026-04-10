@@ -36,8 +36,8 @@ function isFullyInPast(endDateStr) {
  * Falls back gracefully if env vars are not set.
  */
 function createSupabaseClient() {
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const url = (process.env.SUPABASE_URL || '').trim();
+  const key = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
   if (!url || !key) return null;
   return createClient(url.replace(/\/$/, ''), key, {
     auth: { persistSession: false }

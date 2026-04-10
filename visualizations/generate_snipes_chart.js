@@ -9,12 +9,22 @@ const { Client, GatewayIntentBits } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
 
-// Configure via environment (Netlify: Site settings → Environment variables)
+try {
+  require('dotenv').config({ path: path.join(__dirname, '../.env') });
+} catch (_) {}
+
+const { createClient } = require('@supabase/supabase-js');
+
+// Discord Bot Token — set DISCORD_BOT_TOKEN in env or .env (never commit tokens).
 const DISCORD_BOT_TOKEN = (process.env.DISCORD_BOT_TOKEN || '').trim();
-const GUILD_ID = process.env.DISCORD_GUILD_ID || '1361349930660397207';
-const CREATE_TRADES_CHANNEL_ID = process.env.DISCORD_CREATE_TRADES_CHANNEL_ID || '1469438373839114300';
-const TRADE_SUCCESS_CHANNEL_ID = process.env.DISCORD_TRADE_SUCCESS_CHANNEL_ID || '1483793380675686430';
-const CHANNEL_ID = TRADE_SUCCESS_CHANNEL_ID;
+
+// Channel IDs: https://discord.com/channels/1361349930660397207/1469438373839114300 = create-trades, .../1483793380675686430 = trade-success
+const GUILD_ID = '1361349930660397207';
+const CREATE_TRADES_CHANNEL_ID = '1469438373839114300';  // create-trades
+const TRADE_SUCCESS_CHANNEL_ID = '1483793380675686430'; // trade-success (our buys)
+/** Snipes console — Sniper Heartbeat (Tier Mode); tier lines give max buying power per snapshot (~10m). */
+const SNIPES_CONSOLE_CHANNEL_ID = '1385306473051062494';
+const CHANNEL_ID = TRADE_SUCCESS_CHANNEL_ID; // default for backward compat
 
 // Blacklisted items/keywords: bots never try these, so they must NOT be counted as "missed" snipes
 const BLACKLIST_ITEMS = [
@@ -50,6 +60,9 @@ function parsePriceFromMarketFeed(event) {
 const MISSED_PRICE_MIN = 30;
 const MISSED_PRICE_MAX = 1200;
 
+/** Create-trades included in got vs missed / volume (blue) / candidate pool — markup must be ≤ this. */
+const CREATE_TRADES_MARKUP_MAX_PCT = 2;
+
 /**
  * True if this create-trades event is blacklisted (bots don't try for it) — should not count as "missed".
  */
@@ -71,6 +84,82 @@ function isBlacklisted(event) {
   if (hasSymbol && hasFade && hasStatTrak) return true;
 
   return false;
+}
+
+function loadBot1SupabaseConfig() {
+  try {
+    const p = path.join(__dirname, '../config/Bot1/Bot1_config.json');
+    const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+    return {
+      url: String(j.SUPABASE_URL || '').replace(/\/$/, ''),
+      key: String(j.SUPABASE_KEY || '')
+    };
+  } catch {
+    return { url: '', key: '' };
+  }
+}
+
+/** Env first, then config/Bot1/Bot1_config.json (same project Supabase as bots). */
+function resolveSupabaseCredentialsForCharts() {
+  const bot = loadBot1SupabaseConfig();
+  const url = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || bot.url || '').trim().replace(/\/$/, '');
+  const key = (
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.SUPABASE_ANON_KEY ||
+    process.env.VITE_SUPABASE_ANON_KEY ||
+    process.env.VITE_SUPABASE_SERVICE_KEY ||
+    bot.key ||
+    ''
+  ).trim();
+  return { url, key };
+}
+
+function normalizeItemNameForBlacklist(s) {
+  if (s == null || typeof s !== 'string') return '';
+  return s.normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/** Item name from create-trades event for DB blacklist match. */
+function tradeItemDisplayNameForBlacklist(event) {
+  let n = (event.itemName || '').trim();
+  if (!n && event.rawContent) {
+    const m = event.rawContent.match(/(?:Item|Item Name|Name|🎮 Items?)\s*:?\s*([^\n]+)/i);
+    if (m) n = m[1].trim();
+  }
+  return n;
+}
+
+function isSupabaseItemBlacklisted(event, normalizedNameSet) {
+  if (!normalizedNameSet || normalizedNameSet.size === 0) return false;
+  const key = normalizeItemNameForBlacklist(tradeItemDisplayNameForBlacklist(event));
+  if (!key) return false;
+  return normalizedNameSet.has(key);
+}
+
+/**
+ * All distinct normalized item_name values from public.blacklist.
+ */
+async function fetchBlacklistItemNameSet(supabase) {
+  const set = new Set();
+  let page = 0;
+  const pageSize = 1000;
+  for (;;) {
+    const { data, error } = await supabase
+      .from('blacklist')
+      .select('item_name')
+      .not('item_name', 'is', null)
+      .order('id', { ascending: true })
+      .range(page * pageSize, (page + 1) * pageSize - 1);
+    if (error) throw error;
+    if (!data || !data.length) break;
+    for (const row of data) {
+      const n = normalizeItemNameForBlacklist(row.item_name);
+      if (n) set.add(n);
+    }
+    if (data.length < pageSize) break;
+    page += 1;
+  }
+  return set;
 }
 
 /**
@@ -321,8 +410,96 @@ function getMessageContent(message) {
 }
 
 /**
+ * Parse max USD from tier lines like `T7:Jamie($936)` in heartbeat embeds. Uses the largest $ among tiers (top tier balance cap).
+ */
+function parseMaxBalanceUsdFromHeartbeatContent(content) {
+  if (!content || typeof content !== 'string') return null;
+  const re = /T\d+\s*:\s*[^(]*\(\s*\$(\d+(?:\.\d+)?)\s*\)/gi;
+  let m;
+  let max = -Infinity;
+  while ((m = re.exec(content)) !== null) {
+    const v = parseFloat(m[1]);
+    if (Number.isFinite(v)) max = Math.max(max, v);
+  }
+  return max === -Infinity ? null : max;
+}
+
+/**
+ * Parse Snipes console "Sniper Heartbeat (Tier Mode)" message → { timestamp, maxUsd }.
+ */
+function parseTierHeartbeatMessage(message) {
+  const content = getMessageContent(message);
+  if (!/Sniper Heartbeat/i.test(content)) return null;
+  if (!/Tiers/i.test(content) && !/T\d+\s*:/i.test(content)) return null;
+  const maxUsd = parseMaxBalanceUsdFromHeartbeatContent(content);
+  if (maxUsd == null) return null;
+  return { timestamp: message.createdTimestamp, maxUsd };
+}
+
+/**
+ * Snapshots { timestamp, maxUsd } sorted ascending. Returns latest maxUsd at or before timeMs, or null.
+ */
+function maxBalanceUsdAtTime(sortedSnapshots, timeMs) {
+  if (!sortedSnapshots || sortedSnapshots.length === 0) return null;
+  let lo = 0;
+  let hi = sortedSnapshots.length - 1;
+  let ans = null;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (sortedSnapshots[mid].timestamp <= timeMs) {
+      ans = sortedSnapshots[mid].maxUsd;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return ans;
+}
+
+/**
+ * Fetch tier heartbeats from Snipes console for max-balance time series.
+ */
+async function fetchSnipesHeartbeatSnapshots(client, daysBack = 7) {
+  const guild = await client.guilds.fetch(GUILD_ID);
+  const channel = await guild.channels.fetch(SNIPES_CONSOLE_CHANNEL_ID);
+  if (!channel) {
+    throw new Error(`Channel ${SNIPES_CONSOLE_CHANNEL_ID} not found`);
+  }
+  const snapshots = [];
+  const cutoffTime = Date.now() - daysBack * 24 * 60 * 60 * 1000;
+  let lastMessageId = null;
+  let hasMore = true;
+  let fetchedCount = 0;
+  console.log(`📥 Fetching Snipes console heartbeats (${SNIPES_CONSOLE_CHANNEL_ID}, last ${daysBack} days)...`);
+  while (hasMore) {
+    const options = { limit: 100 };
+    if (lastMessageId) options.before = lastMessageId;
+    const messages = await channel.messages.fetch(options);
+    fetchedCount += messages.size;
+    if (messages.size === 0) {
+      hasMore = false;
+      break;
+    }
+    for (const message of messages.values()) {
+      if (message.createdTimestamp < cutoffTime) {
+        hasMore = false;
+        break;
+      }
+      const snap = parseTierHeartbeatMessage(message);
+      if (snap) snapshots.push(snap);
+    }
+    if (messages.size < 100) hasMore = false;
+    else lastMessageId = messages.last().id;
+    console.log(`   Heartbeat fetch: ${fetchedCount} messages, ${snapshots.length} tier snapshots...`);
+  }
+  snapshots.sort((a, b) => a.timestamp - b.timestamp);
+  console.log(`✅ Tier heartbeats: ${snapshots.length} snapshots with max balance`);
+  return snapshots;
+}
+
+/**
  * Parse a create-trades message to extract trade ID, markup, price, and display info.
- * Returns null if no trade ID. Caller should filter to markup ≤ 3%.
+ * Returns null if no trade ID. Caller should filter to markup ≤ CREATE_TRADES_MARKUP_MAX_PCT.
  */
 function parseMarketFeedMessage(message) {
   const content = getMessageContent(message);
@@ -384,33 +561,21 @@ function parseMarketFeedMessage(message) {
 }
 
 /**
- * Fetch messages from a Discord channel (legacy rolling-window helper, still used by main CLI).
+ * Fetch messages from a Discord channel
  */
 async function fetchMessages(client, daysBack = 7, channelId = CHANNEL_ID) {
-  const endMs   = Date.now();
-  const startMs = endMs - (daysBack * 24 * 60 * 60 * 1000);
-  return fetchMessagesInRange(client, startMs, endMs, channelId);
-}
-
-/**
- * Fetch messages from a Discord channel that fall inside [rangeStartMs, rangeEndMs].
- * Pagination stops when we go older than rangeStartMs.
- * Returns an array of parsed event objects.
- */
-async function fetchMessagesInRange(client, rangeStartMs, rangeEndMs, channelId = CHANNEL_ID) {
   const guild = await client.guilds.fetch(GUILD_ID);
   const channel = await guild.channels.fetch(channelId);
-
+  
   if (!channel) {
     throw new Error(`Channel ${channelId} not found`);
   }
 
   const events = [];
-  const cutoffTime = rangeStartMs;
+  const cutoffTime = Date.now() - (daysBack * 24 * 60 * 60 * 1000);
   const parseFn = channelId === TRADE_SUCCESS_CHANNEL_ID ? parseTradeMessage : parseMarketFeedMessage;
 
-  const rangeLabel = `${new Date(rangeStartMs).toISOString().slice(0,10)}..${new Date(rangeEndMs).toISOString().slice(0,10)}`;
-  console.log(`📥 Fetching messages from channel ${channelId} (${rangeLabel})...`);
+  console.log(`📥 Fetching messages from channel ${channelId} (last ${daysBack} days)...`);
 
   let lastMessageId = null;
   let fetchedCount = 0;
@@ -435,8 +600,6 @@ async function fetchMessagesInRange(client, rangeStartMs, rangeEndMs, channelId 
         hasMore = false;
         break;
       }
-      // Skip messages newer than range end (only relevant when range ends before now)
-      if (message.createdTimestamp > rangeEndMs) continue;
       const event = parseFn(message);
       if (event) {
         events.push(event);
@@ -456,21 +619,16 @@ async function fetchMessagesInRange(client, rangeStartMs, rangeEndMs, channelId 
   return events;
 }
 
-/** create-trades rows with markup ≤ 3% (same rule as fetchMarketFeedUnder3). */
-function filterCreateTradesMarkupAtMost3(raw) {
-  return raw.filter((e) => {
-    const pct = e.markupPercent != null ? e.markupPercent : (e.markup && parseFloat(String(e.markup).replace(/[^0-9.-]/g, '')));
-    return typeof pct === 'number' && !isNaN(pct) && pct <= 3;
-  });
-}
-
 /**
- * Fetch create-trades messages. Returns { under3, all } — all messages for lookup enrichment, under3 for missed-snipe logic.
+ * Fetch create-trades messages. Returns { under3, all } — `under3` is markup ≤ CREATE_TRADES_MARKUP_MAX_PCT (name kept for compat); `all` for enrichment.
  */
 async function fetchMarketFeedUnder3(client, daysBack = 7) {
   const raw = await fetchMessages(client, daysBack, CREATE_TRADES_CHANNEL_ID);
-  const under3 = filterCreateTradesMarkupAtMost3(raw);
-  console.log(`📊 create-trades: ${raw.length} messages with trade ID, ${under3.length} with markup ≤3%`);
+  const under3 = raw.filter((e) => {
+    const pct = e.markupPercent != null ? e.markupPercent : (e.markup && parseFloat(String(e.markup).replace(/[^0-9.-]/g, '')));
+    return typeof pct === 'number' && !isNaN(pct) && pct <= CREATE_TRADES_MARKUP_MAX_PCT;
+  });
+  console.log(`📊 create-trades: ${raw.length} messages with trade ID, ${under3.length} with markup ≤${CREATE_TRADES_MARKUP_MAX_PCT}%`);
   return { under3, all: raw };
 }
 
@@ -546,21 +704,27 @@ function dedupeEventsByTradeIdWindow(rows, getTimestamp, getTradeId, windowMs) {
  * Generate HTML with interactive Plotly chart
  * @param {Array} events - trade-success (our buys)
  * @param {number} daysBack
- * @param {Array} missedSnipes - create-trades ≤3% that we did not get (optional)
- * @param {{ startTime?: number, endTime?: number }} options - explicit time range for x-axis (ms); avoids Plotly snapping to midnight
+ * @param {Array} missedSnipes - create-trades ≤2% we did not get and were balance-eligible (optional)
+ * @param {{ startTime?: number, endTime?: number, ineligibleSnipes?: Array, supabaseBlacklistSnipes?: Array, supabaseBlacklistNameCount?: number, heartbeatSnapshots?: Array }} options
  */
 function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
   const endTime = options.endTime != null ? options.endTime : Date.now();
   const startTime = options.startTime != null ? options.startTime : (endTime - (daysBack * 24 * 60 * 60 * 1000));
   const channelBUnder3 = options.channelBUnder3 || [];
   const allCreateTrades = options.allCreateTrades || channelBUnder3;
+  const ineligibleSnipes = options.ineligibleSnipes || [];
+  const supabaseBlacklistSnipes = options.supabaseBlacklistSnipes || [];
+  const supabaseBlacklistNameCount = options.supabaseBlacklistNameCount != null ? options.supabaseBlacklistNameCount : 0;
+  const heartbeatSorted = [...(options.heartbeatSnapshots || [])].sort((a, b) => a.timestamp - b.timestamp);
   // Plotly date axis needs range in milliseconds and autorange: false to respect it
   const xAxisRange = [startTime, endTime];
   // Sort events by timestamp
   events.sort((a, b) => a.timestamp - b.timestamp);
   (missedSnipes || []).sort((a, b) => a.timestamp - b.timestamp);
+  (ineligibleSnipes || []).sort((a, b) => a.timestamp - b.timestamp);
+  (supabaseBlacklistSnipes || []).sort((a, b) => a.timestamp - b.timestamp);
 
-  // Create-trades lookup by trade ID — uses ALL create-trades (not just ≤3%) so Got trade data is always enriched
+  // Create-trades lookup by trade ID — uses ALL create-trades (any markup) so Got trade data is always enriched
   const tradeIdToCreateTrade = {};
   allCreateTrades.forEach((e) => {
     const tid = (e.tradeId || '').trim();
@@ -834,7 +998,7 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
     sizeByHostname[h] = evs.map((e) => valueToSize(parsePrice(e.totalValue)));
   });
 
-  // --- Got vs Missed scatter + rolling 1h % line (trade-success vs create-trades ≤3%) ---
+  // --- Got vs Missed scatter + rolling 1h % line (trade-success vs create-trades ≤2%) ---
   const HOUR_MS = 60 * 60 * 1000;
   const JITTER_Y = 0.45; // heavy jitter on y (0 or 1) so dots spread
   const eventsGotMissedDeduped = dedupeEventsByTradeIdWindow(
@@ -845,6 +1009,18 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
   );
   const missedSnipesDeduped = dedupeEventsByTradeIdWindow(
     missedSnipes || [],
+    (e) => e.timestamp,
+    (e) => e.tradeId,
+    TRADE_ID_DEDUP_WINDOW_MS
+  );
+  const ineligibleSnipesDeduped = dedupeEventsByTradeIdWindow(
+    ineligibleSnipes || [],
+    (e) => e.timestamp,
+    (e) => e.tradeId,
+    TRADE_ID_DEDUP_WINDOW_MS
+  );
+  const supabaseBlacklistSnipesDeduped = dedupeEventsByTradeIdWindow(
+    supabaseBlacklistSnipes || [],
     (e) => e.timestamp,
     (e) => e.tradeId,
     TRADE_ID_DEDUP_WINDOW_MS
@@ -871,10 +1047,43 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
       itemName: e.itemName || 'N/A',
       hover: `Time: ${formatTimestamp(e.timestamp)}<br>Trade ID: ${e.tradeId || 'N/A'}<br>Markup: ${e.markup || 'N/A'}<br>Value: ${e.totalValue || 'N/A'}<br>Item: ${e.itemName || 'N/A'}`
     };
-    p.y = Math.random() * 40;
+    p.y = Math.random() * 20;
     return p;
   });
-  const allGotMissedTimes = [...gotPoints.map((p) => p.t), ...missedPoints.map((p) => p.t)].filter(Boolean);
+  const blacklistPoints = supabaseBlacklistSnipesDeduped.map((e) => {
+    const disp = tradeItemDisplayNameForBlacklist(e) || e.itemName || 'N/A';
+    const p = {
+      t: e.timestamp,
+      date: new Date(e.timestamp),
+      got: -2,
+      tradeId: e.tradeId,
+      hover: `Time: ${formatTimestamp(e.timestamp)}<br>Trade ID: ${e.tradeId || 'N/A'}<br>Supabase blacklist (item_name match)<br>Item: ${disp}<br>Markup: ${e.markup || 'N/A'}<br>Value: ${e.totalValue || 'N/A'}`
+    };
+    p.y = 22 + Math.random() * 14;
+    return p;
+  });
+  const ineligiblePoints = ineligibleSnipesDeduped.map((e) => {
+    const cap = maxBalanceUsdAtTime(heartbeatSorted, e.timestamp);
+    const priceNum = parsePriceFromMarketFeed(e);
+    const p = {
+      t: e.timestamp,
+      date: new Date(e.timestamp),
+      got: -1,
+      tradeId: e.tradeId,
+      markup: e.markup || (e.markupPercent != null ? e.markupPercent + '%' : 'N/A'),
+      totalValue: e.totalValue || 'N/A',
+      itemName: e.itemName || 'N/A',
+      hover: `Time: ${formatTimestamp(e.timestamp)}<br>Trade ID: ${e.tradeId || 'N/A'}<br>Not eligible (price above max tier balance at snapshot)<br>Item price: ${priceNum != null ? '$' + priceNum : (e.totalValue || 'N/A')}<br>Max tier balance @ snapshot: ${cap != null ? '$' + cap : 'N/A'}<br>Markup: ${e.markup || 'N/A'}<br>Item: ${e.itemName || 'N/A'}`
+    };
+    p.y = 42 + Math.random() * 16;
+    return p;
+  });
+  const allGotMissedTimes = [
+    ...gotPoints.map((p) => p.t),
+    ...missedPoints.map((p) => p.t),
+    ...blacklistPoints.map((p) => p.t),
+    ...ineligiblePoints.map((p) => p.t)
+  ].filter(Boolean);
   const tMin = allGotMissedTimes.length ? Math.min(...allGotMissedTimes) : Date.now();
   const tMax = allGotMissedTimes.length ? Math.max(...allGotMissedTimes) : Date.now();
   // Rolling 1h % at each 15-min grid point
@@ -885,7 +1094,7 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
     const windowStart = t - HOUR_MS;
     const gotInWindow = gotPoints.filter((p) => p.t >= windowStart && p.t <= t).length;
     const missedInWindow = missedPoints.filter((p) => p.t >= windowStart && p.t <= t).length;
-    const total = gotInWindow + missedInWindow;
+    const total = gotInWindow + missedInWindow; // eligible tries only (excludes not-eligible gray)
     if (total > 0) {
       rollingPctX.push(new Date(t));
       rollingPctY.push((100 * gotInWindow) / total);
@@ -902,28 +1111,13 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
   // 1-hour bins: snipe count per endpoint (hostname) over time — for line chart above Got vs Missed
   const endpointLineBinTimes = [];
   const endpointLineCountsByHostname = {};
-  const endpointLineTotalAllSnipesPerBin = []; // create-trades ≤3% in bin (got + missed pool)
   for (let t = startTime; t < endTime; t += HOUR_MS) {
     const binEnd = t + HOUR_MS;
     endpointLineBinTimes.push(new Date(t));
-    const totalAllSnipesInBin = channelBUnder3.filter((e) => e.timestamp >= t && e.timestamp < binEnd).length;
-    endpointLineTotalAllSnipesPerBin.push(totalAllSnipesInBin);
     hostnames.forEach((h) => {
       if (!endpointLineCountsByHostname[h]) endpointLineCountsByHostname[h] = [];
       const count = events.filter((e) => e.type === h && e.timestamp >= t && e.timestamp < binEnd).length;
       endpointLineCountsByHostname[h].push(count);
-    });
-  }
-  // Same bins: % of ALL ≤3% snipes in that hour that were got on this endpoint (numerator = got on host only)
-  const endpointLinePctByHostname = {};
-  hostnames.forEach((h) => {
-    endpointLinePctByHostname[h] = [];
-  });
-  for (let i = 0; i < endpointLineBinTimes.length; i++) {
-    const totalAll = endpointLineTotalAllSnipesPerBin[i] || 0;
-    hostnames.forEach((h) => {
-      const got = (endpointLineCountsByHostname[h] && endpointLineCountsByHostname[h][i]) || 0;
-      endpointLinePctByHostname[h].push(totalAll > 0 ? (100 * got) / totalAll : null);
     });
   }
 
@@ -932,26 +1126,35 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
   const stackedBarBinTimes = [];
   const stackedBarGotCounts = [];
   const stackedBarMissedCounts = [];
+  const stackedBarBlacklistCounts = [];
+  const stackedBarIneligibleCounts = [];
   const stackedBarWinRate = [];
-  const stackedBarBinDetails = []; // per-bin rows for click-to-show table: { got: [...], missed: [...] }
+  const stackedBarBinDetails = []; // per-bin: { got, missed, blacklist, ineligible }
   for (let t = tMin; t <= tMax; t += BIN_STEP_MS) {
     const binEnd = t + BIN_STEP_MS;
     const gotInBinPoints = gotPoints.filter((p) => p.t >= t && p.t < binEnd);
     const missedInBinPoints = missedPoints.filter((p) => p.t >= t && p.t < binEnd);
+    const blacklistInBinPoints = blacklistPoints.filter((p) => p.t >= t && p.t < binEnd);
+    const ineligibleInBinPoints = ineligiblePoints.filter((p) => p.t >= t && p.t < binEnd);
     const gotInBin = gotInBinPoints.length;
     const missedInBin = missedInBinPoints.length;
+    const blacklistInBin = blacklistInBinPoints.length;
+    const ineligibleInBin = ineligibleInBinPoints.length;
     const total = gotInBin + missedInBin;
     stackedBarBinTimes.push(new Date(t));
     stackedBarGotCounts.push(gotInBin);
     stackedBarMissedCounts.push(missedInBin);
+    stackedBarBlacklistCounts.push(blacklistInBin);
+    stackedBarIneligibleCounts.push(ineligibleInBin);
     stackedBarWinRate.push(total > 0 ? (100 * gotInBin) / total : null);
-    // Detail rows: data from create-trades (by trade ID); got/missed = type only
     const gotInBinEvents = eventsGotMissedDeduped.filter((e) => e.timestamp >= t && e.timestamp < binEnd);
     const missedInBinEvents = missedSnipesDeduped.filter((e) => e.timestamp >= t && e.timestamp < binEnd);
-    const rowFromEvent = (e, type) => {
+    const blacklistInBinEvents = supabaseBlacklistSnipesDeduped.filter((e) => e.timestamp >= t && e.timestamp < binEnd);
+    const ineligibleInBinEvents = ineligibleSnipesDeduped.filter((e) => e.timestamp >= t && e.timestamp < binEnd);
+    const rowFromEvent = (e, type, capUsd) => {
       const ct = tradeIdToCreateTrade[(e.tradeId || '').trim()] || e;
       const totalValue = ct.totalValue || '';
-      return {
+      const row = {
         type,
         dateTime: formatTimestamp(e.timestamp),
         tradeId: e.tradeId || 'N/A',
@@ -961,27 +1164,37 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
         price: getPriceNumber(ct),
         externalPrice: getExternalPrice(totalValue)
       };
+      if (type === 'ineligible' && capUsd != null) row.maxTierBalanceUsd = capUsd;
+      return row;
     };
     stackedBarBinDetails.push({
       binLabel: formatTimestamp(t) + ' – ' + formatTimestamp(binEnd - 1),
       got: gotInBinEvents.map((e) => rowFromEvent(e, 'got')),
-      missed: missedInBinEvents.map((e) => rowFromEvent(e, 'missed'))
+      missed: missedInBinEvents.map((e) => rowFromEvent(e, 'missed')),
+      blacklist: blacklistInBinEvents.map((e) => rowFromEvent(e, 'blacklist')),
+      ineligible: ineligibleInBinEvents.map((e) => rowFromEvent(e, 'ineligible', maxBalanceUsdAtTime(heartbeatSorted, e.timestamp)))
     });
   }
 
-  // Volume of snipes (create-trades, <=3%): 1-hour bins, then smooth. Also snipes we got per hour.
+  // Volume of snipes (create-trades, ≤2%): 1-hour bins, then smooth. Also snipes we got per hour.
   const volumeBinStep = HOUR_MS;
   const volumeBinTimes = [];
   const volumeBinCounts = [];
   const volumeBinGotCounts = [];
+  const volumeBinBlacklistCounts = [];
+  const volumeBinIneligibleCounts = [];
   for (let t = startTime; t < endTime; t += volumeBinStep) {
     const binEnd = t + volumeBinStep;
     volumeBinTimes.push(new Date(t));
     volumeBinCounts.push(channelBUnder3.filter((e) => e.timestamp >= t && e.timestamp < binEnd).length);
     volumeBinGotCounts.push(events.filter((e) => e.timestamp >= t && e.timestamp < binEnd).length);
+    volumeBinBlacklistCounts.push(supabaseBlacklistSnipesDeduped.filter((e) => e.timestamp >= t && e.timestamp < binEnd).length);
+    volumeBinIneligibleCounts.push(ineligibleSnipesDeduped.filter((e) => e.timestamp >= t && e.timestamp < binEnd).length);
   }
   const smoothedVolumeCounts = [];
   const smoothedGotCounts = [];
+  const smoothedBlacklistCounts = [];
+  const smoothedIneligibleCounts = [];
   for (let i = 0; i < volumeBinCounts.length; i++) {
     const prev = i > 0 ? volumeBinCounts[i - 1] : volumeBinCounts[i];
     const next = i < volumeBinCounts.length - 1 ? volumeBinCounts[i + 1] : volumeBinCounts[i];
@@ -989,6 +1202,12 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
     const gPrev = i > 0 ? volumeBinGotCounts[i - 1] : volumeBinGotCounts[i];
     const gNext = i < volumeBinGotCounts.length - 1 ? volumeBinGotCounts[i + 1] : volumeBinGotCounts[i];
     smoothedGotCounts.push((gPrev + volumeBinGotCounts[i] + gNext) / 3);
+    const bPrev = i > 0 ? volumeBinBlacklistCounts[i - 1] : volumeBinBlacklistCounts[i];
+    const bNext = i < volumeBinBlacklistCounts.length - 1 ? volumeBinBlacklistCounts[i + 1] : volumeBinBlacklistCounts[i];
+    smoothedBlacklistCounts.push((bPrev + volumeBinBlacklistCounts[i] + bNext) / 3);
+    const iPrev = i > 0 ? volumeBinIneligibleCounts[i - 1] : volumeBinIneligibleCounts[i];
+    const iNext = i < volumeBinIneligibleCounts.length - 1 ? volumeBinIneligibleCounts[i + 1] : volumeBinIneligibleCounts[i];
+    smoothedIneligibleCounts.push((iPrev + volumeBinIneligibleCounts[i] + iNext) / 3);
   }
 
   const html = `<!DOCTYPE html>
@@ -1403,27 +1622,21 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
         
         <div class="section-title" style="margin-top: 40px; font-size: 1.5em; font-weight: bold; color: #333;">📈 Snipe count by endpoint over time (1h bins)</div>
         <div class="info" style="margin-top: 8px;">
-            One line per hostname/endpoint. X: datetime, Y: snipe count per hour (trade-success only — snipes we got).
+            One line per hostname/endpoint. X: datetime, Y: snipe count per hour.
         </div>
         <div id="chartEndpointLines" style="width: 100%; height: 450px; margin-top: 10px;"></div>
         
-        <div class="section-title" style="margin-top: 28px; font-size: 1.5em; font-weight: bold; color: #333;">📈 Share of all snipes by endpoint (1h bins)</div>
+        <div class="section-title" style="margin-top: 32px; font-size: 1.5em; font-weight: bold; color: #333;">📈 Snipes We Got vs We Missed (trade-success vs create-trades ≤2%)</div>
         <div class="info" style="margin-top: 8px;">
-            Same lines as above, but Y = <strong>(snipes we got on this endpoint in the hour) ÷ (all create-trades ≤3% in that hour) × 100</strong>.
-            Denominator is every ≤3% listing (got + missed). Missed trades are not assigned to a hostname, so lines sum to at most 100%.
-        </div>
-        <div id="chartEndpointLinesPct" style="width: 100%; height: 450px; margin-top: 10px;"></div>
-        
-        <div class="section-title" style="margin-top: 32px; font-size: 1.5em; font-weight: bold; color: #333;">📈 Snipes We Got vs We Missed (trade-success vs create-trades ≤3%)</div>
-        <div class="info" style="margin-top: 8px;">
-            Y-axis: % of snipes we got (dots: green = got, red = missed, with jitter). Line: smoothed % of snipes we are taking (rolling 1h).
+            Y-axis bands: green = got, red = missed (eligible), <strong>black = Supabase blacklist</strong> (<code>blacklist.item_name</code> exact match on skin name), <strong>gray = not eligible</strong> (price above max tier balance from heartbeat). Rolling line: got ÷ (got + missed eligible) only.
+            Supabase blacklist names loaded: <strong>${supabaseBlacklistNameCount}</strong>. Tier snapshots: <strong>${heartbeatSorted.length}</strong> (channel <code>${SNIPES_CONSOLE_CHANNEL_ID}</code>).
             Same <strong>12h trade-ID dedupe</strong> as the hourly bar chart (repeated IDs within 12h count once).
         </div>
         <div id="chartGotMissed" style="width: 100%; height: 500px; margin-top: 10px;"></div>
         
         <div class="section-title" style="margin-top: 32px; font-size: 1.3em; font-weight: bold; color: #333;">📊 Counts per 1 hour (grouped bars + % got line)</div>
         <div class="info" style="margin-top: 8px;">
-            <strong>Left Y-axis:</strong> counts per hour — green = got, red = missed (grouped bars). <strong>Right Y-axis (0–100%):</strong> line = got ÷ (got + missed) for that hour (no activity → gap in the line).
+            <strong>Left Y-axis:</strong> four grouped bars per hour — green = got, red = missed (eligible), <strong>black = Supabase blacklist</strong>, <strong>gray = not eligible</strong>. <strong>Right Y-axis (0–100%):</strong> line = got ÷ (got + missed eligible); blacklist and not-eligible are excluded from this rate.
             <strong>Trade IDs</strong> deduped: if the same ID appears again within <strong>12 hours</strong> of a previous message, only the first is counted (duplicate notifications seconds apart). The same ID after a longer gap is kept as a separate row.
         </div>
         <div id="chartGotMissedStacked" style="width: 100%; height: 450px; margin-top: 10px;"></div>
@@ -1447,9 +1660,9 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
             </table>
         </div>
         
-        <div class="section-title" style="margin-top: 32px; font-size: 1.3em; font-weight: bold; color: #333;">📊 Volume (create-trades ≤3%) + Snipes we got (1h bins, smoothed)</div>
+        <div class="section-title" style="margin-top: 32px; font-size: 1.3em; font-weight: bold; color: #333;">📊 Volume (create-trades ≤2%) + Snipes we got (1h bins, smoothed)</div>
         <div class="info" style="margin-top: 8px;">
-            Blue: items ≤3% in create-trades per hour. Green: snipes we got per hour. Same 3-point smoothing.
+            Blue: items ≤2% in create-trades per hour. Green: snipes we got per hour. <strong>Black line:</strong> Supabase blacklist matches per hour. <strong>Gray line:</strong> not eligible per hour (above max tier balance at snapshot). Same 3-point smoothing.
         </div>
         <div id="chartVolume" style="width: 100%; height: 400px; margin-top: 10px;"></div>
         
@@ -1476,7 +1689,7 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
         </div>
         
         <div class="table-container" style="margin-top: 40px;">
-            <div class="table-header">❌ Snipes We Did NOT Get (create-trades ≤3%, not in trade-success, price 30–1200)</div>
+            <div class="table-header">❌ Missed (eligible) — we could afford but did not get (create-trades ≤2%, not in trade-success, price 30–1200, price ≤ max tier balance @ time)</div>
             <input type="text" class="search-box" id="searchMissedBox" placeholder="Search missed snipes by Trade ID, value, markup...">
             <table id="missedSnipesTable">
                 <thead>
@@ -1490,6 +1703,45 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
                     </tr>
                 </thead>
                 <tbody id="missedSnipesTableBody">
+                </tbody>
+            </table>
+        </div>
+        
+        <div class="table-container" style="margin-top: 40px;">
+            <div class="table-header">⬛ Supabase blacklist — item_name match (create-trades ≤2%, not in trade-success, price 30–1200)</div>
+            <input type="text" class="search-box" id="searchBlacklistBox" placeholder="Search by Trade ID, item, markup...">
+            <table id="supabaseBlacklistSnipesTable">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Trade ID</th>
+                        <th>Markup</th>
+                        <th>Value</th>
+                        <th>Item</th>
+                        <th>Raw (snippet)</th>
+                    </tr>
+                </thead>
+                <tbody id="supabaseBlacklistSnipesTableBody">
+                </tbody>
+            </table>
+        </div>
+        
+        <div class="table-container" style="margin-top: 40px;">
+            <div class="table-header">⊘ Not eligible — above max tier balance (no buy attempt; create-trades ≤2%, not in trade-success, price 30–1200)</div>
+            <input type="text" class="search-box" id="searchIneligibleBox" placeholder="Search by Trade ID, value, markup...">
+            <table id="ineligibleSnipesTable">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Trade ID</th>
+                        <th>Markup</th>
+                        <th>Value</th>
+                        <th>Max tier $ @ time</th>
+                        <th>Item</th>
+                        <th>Raw (snippet)</th>
+                    </tr>
+                </thead>
+                <tbody id="ineligibleSnipesTableBody">
                 </tbody>
             </table>
         </div>
@@ -1527,20 +1779,24 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
         // Got vs Missed scatter + rolling % line
         const gotPointsClient = ${JSON.stringify(gotPoints.map((p) => ({ date: p.date.toISOString(), y: p.y, hover: p.hover })))};
         const missedPointsClient = ${JSON.stringify(missedPoints.map((p) => ({ date: p.date.toISOString(), y: p.y, hover: p.hover })))};
+        const blacklistPointsClient = ${JSON.stringify(blacklistPoints.map((p) => ({ date: p.date.toISOString(), y: p.y, hover: p.hover })))};
+        const ineligiblePointsClient = ${JSON.stringify(ineligiblePoints.map((p) => ({ date: p.date.toISOString(), y: p.y, hover: p.hover })))};
         const rollingPctXClient = ${JSON.stringify(rollingPctX.map((d) => d.toISOString()))};
         const smoothedRollingPctYClient = ${JSON.stringify(smoothedRollingPctY)};
         const endpointLineBinTimesClient = ${JSON.stringify(endpointLineBinTimes.map((d) => d.toISOString()))};
         const endpointLineCountsByHostnameClient = ${JSON.stringify(endpointLineCountsByHostname)};
-        const endpointLinePctByHostnameClient = ${JSON.stringify(endpointLinePctByHostname)};
-        const endpointLineTotalAllSnipesPerBinClient = ${JSON.stringify(endpointLineTotalAllSnipesPerBin)};
         const stackedBarBinTimesClient = ${JSON.stringify(stackedBarBinTimes.map((d) => d.toISOString()))};
         const stackedBarGotCountsClient = ${JSON.stringify(stackedBarGotCounts)};
         const stackedBarMissedCountsClient = ${JSON.stringify(stackedBarMissedCounts)};
+        const stackedBarBlacklistCountsClient = ${JSON.stringify(stackedBarBlacklistCounts)};
+        const stackedBarIneligibleCountsClient = ${JSON.stringify(stackedBarIneligibleCounts)};
         const stackedBarBinDetailsClient = ${JSON.stringify(stackedBarBinDetails)};
         const stackedBarWinRateClient = ${JSON.stringify(stackedBarWinRate)};
         const volumeBinTimesClient = ${JSON.stringify(volumeBinTimes.map((d) => d.toISOString()))};
         const smoothedVolumeCountsClient = ${JSON.stringify(smoothedVolumeCounts)};
         const smoothedGotCountsClient = ${JSON.stringify(smoothedGotCounts)};
+        const smoothedBlacklistCountsClient = ${JSON.stringify(smoothedBlacklistCounts)};
+        const smoothedIneligibleCountsClient = ${JSON.stringify(smoothedIneligibleCounts)};
         const allMissedForTable = ${JSON.stringify(missedSnipesDeduped.map((e) => ({
           time: formatTimestamp(e.timestamp),
           timestamp: e.timestamp,
@@ -1548,6 +1804,25 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
           markup: e.markup || (e.markupPercent != null ? e.markupPercent + '%' : 'N/A'),
           value: e.totalValue || 'N/A',
           item: e.itemName || 'N/A',
+          raw: (e.rawContent || '').substring(0, 300)
+        })))};
+        const allBlacklistForTable = ${JSON.stringify(supabaseBlacklistSnipesDeduped.map((e) => ({
+          time: formatTimestamp(e.timestamp),
+          timestamp: e.timestamp,
+          tradeId: e.tradeId || 'N/A',
+          markup: e.markup || (e.markupPercent != null ? e.markupPercent + '%' : 'N/A'),
+          value: e.totalValue || 'N/A',
+          item: tradeItemDisplayNameForBlacklist(e) || e.itemName || 'N/A',
+          raw: (e.rawContent || '').substring(0, 300)
+        })))};
+        const allIneligibleForTable = ${JSON.stringify(ineligibleSnipesDeduped.map((e) => ({
+          time: formatTimestamp(e.timestamp),
+          timestamp: e.timestamp,
+          tradeId: e.tradeId || 'N/A',
+          markup: e.markup || (e.markupPercent != null ? e.markupPercent + '%' : 'N/A'),
+          value: e.totalValue || 'N/A',
+          item: e.itemName || 'N/A',
+          maxTierUsd: maxBalanceUsdAtTime(heartbeatSorted, e.timestamp),
           raw: (e.rawContent || '').substring(0, 300)
         })))};
         
@@ -1802,42 +2077,9 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
             Plotly.newPlot(chartEndpointLinesDiv, endpointTraces, endpointLayout, config);
         }
 
-        const chartEndpointLinesPctDiv = document.getElementById('chartEndpointLinesPct');
-        if (chartEndpointLinesPctDiv && endpointLineBinTimesClient.length > 0) {
-            const endpointPctTraces = hostnames.map((h) => {
-                const counts = endpointLineCountsByHostnameClient[h] || [];
-                const customdata = endpointLineBinTimesClient.map(function (_, i) {
-                    const got = counts[i] != null ? counts[i] : 0;
-                    const tot = (endpointLineTotalAllSnipesPerBinClient[i] != null) ? endpointLineTotalAllSnipesPerBinClient[i] : 0;
-                    return got + ' got / ' + tot + ' all ≤3%';
-                });
-                return {
-                    x: endpointLineBinTimesClient,
-                    y: endpointLinePctByHostnameClient[h] || [],
-                    customdata: customdata,
-                    mode: 'lines',
-                    type: 'scatter',
-                    name: h,
-                    line: { color: hostnameToColor[h], width: 2, shape: 'spline' },
-                    showlegend: true,
-                    hovertemplate: '<b>' + h + '</b><br>%{customdata}<br>%{y:.1f}%<extra></extra>'
-                };
-            });
-            const endpointPctLayout = {
-                title: { text: 'Share of hourly ≤3% snipes by endpoint (%)' },
-                xaxis: { title: 'Time', type: 'date', range: ${JSON.stringify(xAxisRange)}, autorange: false },
-                yaxis: { title: '% of all ≤3% snipes that hour', rangemode: 'tozero', ticksuffix: '%' },
-                hovermode: 'x unified',
-                showlegend: true,
-                legend: { x: 1.02, y: 1, xanchor: 'left' },
-                margin: { l: 64, r: 180, t: 50, b: 50 }
-            };
-            Plotly.newPlot(chartEndpointLinesPctDiv, endpointPctTraces, endpointPctLayout, config);
-        }
-
         // Got vs Missed scatter chart
         const chartGotMissedDiv = document.getElementById('chartGotMissed');
-        if (chartGotMissedDiv && gotPointsClient.length + missedPointsClient.length > 0) {
+        if (chartGotMissedDiv && gotPointsClient.length + missedPointsClient.length + blacklistPointsClient.length + ineligiblePointsClient.length > 0) {
             const gotTrace = {
                 x: gotPointsClient.map(p => p.date),
                 y: gotPointsClient.map(p => p.y),
@@ -1854,9 +2096,31 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
                 y: missedPointsClient.map(p => p.y),
                 mode: 'markers',
                 type: 'scatter',
-                name: 'Snipes we missed',
+                name: 'Missed (eligible)',
                 marker: { size: 10, color: '#ef4444', symbol: 'x', opacity: 0.8, line: { width: 1, color: '#fff' } },
                 text: missedPointsClient.map(p => p.hover),
+                hovertemplate: '%{text}<extra></extra>',
+                showlegend: true
+            };
+            const blacklistTrace = {
+                x: blacklistPointsClient.map(p => p.date),
+                y: blacklistPointsClient.map(p => p.y),
+                mode: 'markers',
+                type: 'scatter',
+                name: 'Supabase blacklist',
+                marker: { size: 10, color: '#111827', symbol: 'diamond', opacity: 0.9, line: { width: 1, color: '#e5e7eb' } },
+                text: blacklistPointsClient.map(p => p.hover),
+                hovertemplate: '%{text}<extra></extra>',
+                showlegend: true
+            };
+            const ineligibleTrace = {
+                x: ineligiblePointsClient.map(p => p.date),
+                y: ineligiblePointsClient.map(p => p.y),
+                mode: 'markers',
+                type: 'scatter',
+                name: 'Not eligible (above max tier $)',
+                marker: { size: 10, color: '#9ca3af', symbol: 'square', opacity: 0.85, line: { width: 1, color: '#fff' } },
+                text: ineligiblePointsClient.map(p => p.hover),
                 hovertemplate: '%{text}<extra></extra>',
                 showlegend: true
             };
@@ -1865,19 +2129,19 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
                 y: smoothedRollingPctYClient,
                 mode: 'lines',
                 type: 'scatter',
-                name: '% snipes we take (1h smoothed)',
+                name: '% got of eligible (1h smoothed)',
                 line: { color: '#667eea', width: 3, shape: 'spline' },
                 showlegend: true
             };
             const gotMissedLayout = {
-                title: { text: 'Got vs Missed • Y: % we got (jittered) • Line: rolling 1h %' },
+                title: { text: 'Got / Missed / Blacklist / Not eligible • Line: rolling 1h % (eligible tries only)' },
                 xaxis: { title: 'Time of day', type: 'date', range: ${JSON.stringify(xAxisRange)}, autorange: false },
                 yaxis: { title: '% of snipes we got', range: [0, 105], tickformat: '.0f', ticksuffix: '%' },
                 hovermode: 'closest',
                 showlegend: true,
                 legend: { x: 0.02, y: 0.98 }
             };
-            Plotly.newPlot(chartGotMissedDiv, [gotTrace, missedTrace, lineTrace], gotMissedLayout, config);
+            Plotly.newPlot(chartGotMissedDiv, [gotTrace, missedTrace, blacklistTrace, ineligibleTrace, lineTrace], gotMissedLayout, config);
         }
 
         // Counts (15-min bins): grouped bars + line = snipes we got
@@ -1895,8 +2159,24 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
                 x: stackedBarBinTimesClient,
                 y: stackedBarMissedCountsClient,
                 type: 'bar',
-                name: 'Missed',
+                name: 'Missed (eligible)',
                 marker: { color: '#ef4444' },
+                showlegend: true
+            };
+            const blacklistBarTrace = {
+                x: stackedBarBinTimesClient,
+                y: stackedBarBlacklistCountsClient,
+                type: 'bar',
+                name: 'Supabase blacklist',
+                marker: { color: '#111827' },
+                showlegend: true
+            };
+            const ineligibleBarTrace = {
+                x: stackedBarBinTimesClient,
+                y: stackedBarIneligibleCountsClient,
+                type: 'bar',
+                name: 'Not eligible',
+                marker: { color: '#9ca3af' },
                 showlegend: true
             };
             const gotLineTrace = {
@@ -1904,7 +2184,7 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
                 y: stackedBarWinRateClient,
                 mode: 'lines',
                 type: 'scatter',
-                name: '% got (hour)',
+                name: '% got of eligible (hour)',
                 yaxis: 'y2',
                 line: { color: '#667eea', width: 3, shape: 'spline' },
                 connectgaps: false,
@@ -1912,7 +2192,7 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
             };
             const stackedLayout = {
                 barmode: 'group',
-                title: { text: 'Counts per 1 hour (bars) + % got (line, right axis)' },
+                title: { text: 'Counts per 1 hour: got / missed / blacklist / not eligible + % got of eligible (line)' },
                 xaxis: { title: 'Time', type: 'date', range: ${JSON.stringify(xAxisRange)}, autorange: false },
                 yaxis: {
                     title: 'Count per 1 hour',
@@ -1935,22 +2215,34 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
                 legend: { x: 1.02, y: 1, xanchor: 'left' },
                 margin: { l: 60, r: 72, t: 50, b: 50 }
             };
-            Plotly.newPlot(chartStackedDiv, [gotBarTrace, missedBarTrace, gotLineTrace], stackedLayout, config);
+            Plotly.newPlot(chartStackedDiv, [gotBarTrace, missedBarTrace, blacklistBarTrace, ineligibleBarTrace, gotLineTrace], stackedLayout, config);
             chartStackedDiv.on('plotly_click', function(event) {
                 const pt = event.points[0];
                 const binIndex = pt.pointNumber;
                 const detail = stackedBarBinDetailsClient[binIndex];
                 if (!detail) return;
                 document.getElementById('barChartTableBinLabel').textContent = detail.binLabel;
-                const rows = [...detail.got, ...detail.missed];
+                const rows = [...detail.got, ...detail.missed, ...(detail.blacklist || []), ...(detail.ineligible || [])];
                 const tbody = document.getElementById('barChartDetailTableBody');
                 const esc = (s) => (s || '').replace(/</g, '&lt;').replace(/"/g, '&quot;');
-                tbody.innerHTML = rows.map((r) => '<tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px; font-weight: bold; color: ' + (r.type === 'got' ? '#22c55e' : '#ef4444') + ';">' + (r.type === 'got' ? 'Got' : 'Missed') + '</td><td style="padding: 8px;">' + esc(r.dateTime) + '</td><td style="padding: 8px;">' + esc(r.tradeId) + '</td><td style="padding: 8px;">' + esc(r.markup) + '</td><td style="padding: 8px;">' + esc(r.liquidity) + '</td><td style="padding: 8px;">' + esc(r.buffPrice) + '</td><td style="padding: 8px;">' + esc(r.price) + '</td><td style="padding: 8px;">' + esc(r.externalPrice) + '</td></tr>').join('');
+                function typeCell(r) {
+                    if (r.type === 'got') return { label: 'Got', color: '#22c55e' };
+                    if (r.type === 'blacklist') return { label: 'Supabase blacklist', color: '#111827' };
+                    if (r.type === 'ineligible') {
+                        const suffix = (r.maxTierBalanceUsd != null && r.maxTierBalanceUsd !== '') ? ' (max $' + r.maxTierBalanceUsd + ')' : '';
+                        return { label: 'Not eligible' + suffix, color: '#9ca3af' };
+                    }
+                    return { label: 'Missed', color: '#ef4444' };
+                }
+                tbody.innerHTML = rows.map((r) => {
+                    const tc = typeCell(r);
+                    return '<tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px; font-weight: bold; color: ' + tc.color + ';">' + esc(tc.label) + '</td><td style="padding: 8px;">' + esc(r.dateTime) + '</td><td style="padding: 8px;">' + esc(r.tradeId) + '</td><td style="padding: 8px;">' + esc(r.markup) + '</td><td style="padding: 8px;">' + esc(r.liquidity) + '</td><td style="padding: 8px;">' + esc(r.buffPrice) + '</td><td style="padding: 8px;">' + esc(r.price) + '</td><td style="padding: 8px;">' + esc(r.externalPrice) + '</td></tr>';
+                }).join('');
                 document.getElementById('barChartTableSection').style.display = 'block';
             });
         }
 
-        // Volume of items ≤3% + snipes we got (1h bins, smoothed)
+        // Volume of items ≤2% + snipes we got (1h bins, smoothed)
         const chartVolumeDiv = document.getElementById('chartVolume');
         if (chartVolumeDiv && volumeBinTimesClient.length > 0) {
             const volumeTrace = {
@@ -1958,7 +2250,7 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
                 y: smoothedVolumeCountsClient,
                 mode: 'lines',
                 type: 'scatter',
-                name: 'Items ≤3% (create-trades)',
+                name: 'Items ≤2% (create-trades)',
                 line: { color: '#0ea5e9', width: 2, shape: 'spline' },
                 fill: 'tozeroy',
                 fillcolor: 'rgba(14, 165, 233, 0.15)',
@@ -1973,14 +2265,32 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
                 line: { color: '#22c55e', width: 2, shape: 'spline' },
                 showlegend: true
             };
+            const blacklistVolumeTrace = {
+                x: volumeBinTimesClient,
+                y: smoothedBlacklistCountsClient,
+                mode: 'lines',
+                type: 'scatter',
+                name: 'Supabase blacklist',
+                line: { color: '#111827', width: 2, shape: 'spline', dash: 'dash' },
+                showlegend: true
+            };
+            const ineligibleVolumeTrace = {
+                x: volumeBinTimesClient,
+                y: smoothedIneligibleCountsClient,
+                mode: 'lines',
+                type: 'scatter',
+                name: 'Not eligible (above max tier $)',
+                line: { color: '#9ca3af', width: 2, shape: 'spline', dash: 'dot' },
+                showlegend: true
+            };
             const volumeLayout = {
-                title: { text: 'Volume (create-trades ≤3%) + Snipes we got (1h bins, smoothed)' },
-                xaxis: { title: 'Time of day', type: 'date' },
+                title: { text: 'Volume (create-trades ≤2%) + got + blacklist + not eligible (1h bins, smoothed)' },
+                xaxis: { title: 'Time of day', type: 'date', range: ${JSON.stringify(xAxisRange)}, autorange: false },
                 yaxis: { title: 'Count per hour', rangemode: 'tozero' },
                 hovermode: 'x unified',
                 showlegend: true
             };
-            Plotly.newPlot(chartVolumeDiv, [volumeTrace, gotVolumeTrace], volumeLayout, config);
+            Plotly.newPlot(chartVolumeDiv, [volumeTrace, gotVolumeTrace, blacklistVolumeTrace, ineligibleVolumeTrace], volumeLayout, config);
         }
 
         // Missed snipes table
@@ -1999,6 +2309,38 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
             });
         }
         renderMissedTable(filteredMissed);
+
+        let filteredBlacklist = [...allBlacklistForTable];
+        function renderBlacklistTable(rows) {
+            const tbody = document.getElementById('supabaseBlacklistSnipesTableBody');
+            if (!tbody) return;
+            tbody.innerHTML = rows.map(r => '<tr><td>' + r.time + '</td><td>' + r.tradeId + '</td><td>' + r.markup + '</td><td>' + r.value + '</td><td>' + (r.item || '') + '</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;" title="' + (r.raw || '').replace(/"/g, '&quot;') + '">' + (r.raw || '').replace(/</g, '&lt;') + '</td></tr>').join('');
+        }
+        const searchBlacklistBox = document.getElementById('searchBlacklistBox');
+        if (searchBlacklistBox) {
+            searchBlacklistBox.addEventListener('input', function() {
+                const q = this.value.toLowerCase();
+                filteredBlacklist = q ? allBlacklistForTable.filter(r => [r.tradeId, r.markup, r.value, r.item, r.raw].some(v => String(v || '').toLowerCase().includes(q))) : [...allBlacklistForTable];
+                renderBlacklistTable(filteredBlacklist);
+            });
+        }
+        renderBlacklistTable(filteredBlacklist);
+
+        let filteredIneligible = [...allIneligibleForTable];
+        function renderIneligibleTable(rows) {
+            const tbody = document.getElementById('ineligibleSnipesTableBody');
+            if (!tbody) return;
+            tbody.innerHTML = rows.map(r => '<tr><td>' + r.time + '</td><td>' + r.tradeId + '</td><td>' + r.markup + '</td><td>' + r.value + '</td><td>' + (r.maxTierUsd != null ? '$' + r.maxTierUsd : '—') + '</td><td>' + (r.item || '') + '</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;" title="' + (r.raw || '').replace(/"/g, '&quot;') + '">' + (r.raw || '').replace(/</g, '&lt;') + '</td></tr>').join('');
+        }
+        const searchIneligibleBox = document.getElementById('searchIneligibleBox');
+        if (searchIneligibleBox) {
+            searchIneligibleBox.addEventListener('input', function() {
+                const q = this.value.toLowerCase();
+                filteredIneligible = q ? allIneligibleForTable.filter(r => [r.tradeId, r.markup, r.value, r.item, r.raw, String(r.maxTierUsd || '')].some(v => String(v || '').toLowerCase().includes(q))) : [...allIneligibleForTable];
+                renderIneligibleTable(filteredIneligible);
+            });
+        }
+        renderIneligibleTable(filteredIneligible);
 
         // Clustering state
         let clustersEnabled = false;
@@ -2440,154 +2782,6 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
 }
 
 /**
- * Build full dashboard HTML for an explicit UTC calendar date range.
- * startDateStr / endDateStr: 'YYYY-MM-DD'
- * supabaseClient: optional Supabase client (from snipesCache.cjs) — pass null to skip caching.
- * Returns { html, cacheHit }
- */
-async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient) {
-  if (!DISCORD_BOT_TOKEN) {
-    throw new Error('Missing DISCORD_BOT_TOKEN environment variable');
-  }
-
-  const {
-    dateStringToRange,
-    isFullyInPast,
-    loadCache,
-    upsertCache,
-    getChannelWatermark
-  } = require('./snipesCache.cjs');
-
-  const { startMs: chartStartMs, endMs: chartEndMs } = dateStringToRange(startDateStr);
-  const { endMs: endDayMs }  = dateStringToRange(endDateStr);
-  const rangeStartMs = chartStartMs;
-  const rangeEndMs   = endDayMs;
-
-  // Days count for generateHTML label
-  const [sy, sm, sd] = startDateStr.split('-').map(Number);
-  const [ey, em, ed] = endDateStr.split('-').map(Number);
-  const daysBack = Math.round((Date.UTC(ey, em-1, ed) - Date.UTC(sy, sm-1, sd)) / 86400000) + 1;
-
-  const client = new Client({
-    intents: [
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.MessageContent
-    ]
-  });
-
-  await client.login(DISCORD_BOT_TOKEN);
-
-  try {
-    // --- Cheap watermark check (skip entirely for past-only ranges) ---
-    let wmTradeSuccess = '';
-    let wmCreateTrades = '';
-    const rangeIsPast = isFullyInPast(endDateStr);
-
-    if (!rangeIsPast) {
-      // Parallel watermark fetch from both channels
-      const guild = await client.guilds.fetch(GUILD_ID);
-      const [tsChan, ctChan] = await Promise.all([
-        guild.channels.fetch(TRADE_SUCCESS_CHANNEL_ID),
-        guild.channels.fetch(CREATE_TRADES_CHANNEL_ID)
-      ]);
-      [wmTradeSuccess, wmCreateTrades] = await Promise.all([
-        getChannelWatermark(tsChan),
-        getChannelWatermark(ctChan)
-      ]);
-    }
-
-    // --- Try cache ---
-    if (supabaseClient) {
-      const cached = await loadCache(supabaseClient, startDateStr, endDateStr);
-      if (cached) {
-        const isHit = rangeIsPast || (
-          cached.watermarkTradeSuccess === wmTradeSuccess &&
-          cached.watermarkCreateTrades === wmCreateTrades
-        );
-        if (isHit) {
-          console.log(`[cache] HIT ${startDateStr}..${endDateStr}`);
-          const { events, missedSnipes, marketFeedUnder3, allCreateTrades, chartStartMs: cSt, chartEndMs: cEn } = cached.payload;
-          const html = generateHTML(events, daysBack, missedSnipes, {
-            startTime: cSt,
-            endTime:   cEn,
-            channelBUnder3: marketFeedUnder3,
-            allCreateTrades: allCreateTrades
-          });
-          return { html, cacheHit: true };
-        }
-        console.log(`[cache] STALE ${startDateStr}..${endDateStr} (watermarks changed)`);
-      } else {
-        console.log(`[cache] MISS ${startDateStr}..${endDateStr}`);
-      }
-    }
-
-    // --- Full Discord fetch ---
-    const [events, allCreateTrades] = await Promise.all([
-      fetchMessagesInRange(client, rangeStartMs, rangeEndMs, TRADE_SUCCESS_CHANNEL_ID),
-      fetchMessagesInRange(client, rangeStartMs, rangeEndMs, CREATE_TRADES_CHANNEL_ID)
-    ]);
-    const marketFeedUnder3 = filterCreateTradesMarkupAtMost3(allCreateTrades);
-    const gotIds = new Set(events.map((e) => (e.tradeId || '').trim()).filter(Boolean));
-    const missedSnipes = marketFeedUnder3.filter((e) => {
-      const tid = (e.tradeId || '').trim();
-      if (gotIds.has(tid)) return false;
-      if (isBlacklisted(e)) return false;
-      const price = parsePriceFromMarketFeed(e);
-      if (price != null && (price < MISSED_PRICE_MIN || price > MISSED_PRICE_MAX)) return false;
-      return true;
-    });
-
-    // --- Upsert cache ---
-    if (supabaseClient) {
-      // Get watermarks for current-day ranges if not fetched yet
-      if (rangeIsPast) {
-        try {
-          const guild = await client.guilds.fetch(GUILD_ID);
-          const [tsChan, ctChan] = await Promise.all([
-            guild.channels.fetch(TRADE_SUCCESS_CHANNEL_ID),
-            guild.channels.fetch(CREATE_TRADES_CHANNEL_ID)
-          ]);
-          [wmTradeSuccess, wmCreateTrades] = await Promise.all([
-            getChannelWatermark(tsChan),
-            getChannelWatermark(ctChan)
-          ]);
-        } catch (_) {}
-      }
-      await upsertCache(supabaseClient, startDateStr, endDateStr, {
-        events, missedSnipes, marketFeedUnder3, allCreateTrades,
-        chartStartMs: rangeStartMs,
-        chartEndMs:   rangeEndMs
-      }, wmTradeSuccess, wmCreateTrades);
-    }
-
-    const html = generateHTML(events, daysBack, missedSnipes, {
-      startTime: rangeStartMs,
-      endTime:   rangeEndMs,
-      channelBUnder3: marketFeedUnder3,
-      allCreateTrades: allCreateTrades
-    });
-    return { html, cacheHit: false };
-  } finally {
-    await client.destroy().catch(() => {});
-  }
-}
-
-/**
- * Legacy helper: rolling N-day window from now.
- * Converts to a date range and delegates to getHtmlForDateRange.
- */
-async function getHtml(daysBack) {
-  const days = Math.min(30, Math.max(1, Math.floor(Number(daysBack)) || 1));
-  const now   = new Date();
-  const endDateStr   = now.toISOString().slice(0, 10);
-  const startUTC     = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - (days - 1)));
-  const startDateStr = startUTC.toISOString().slice(0, 10);
-  const { html } = await getHtmlForDateRange(startDateStr, endDateStr, null);
-  return html;
-}
-
-/**
  * Main function
  */
 async function main() {
@@ -2601,7 +2795,7 @@ async function main() {
   }
 
   if (!DISCORD_BOT_TOKEN) {
-    console.error('❌ Set DISCORD_BOT_TOKEN in your environment (see .env.example).');
+    console.error('❌ Missing DISCORD_BOT_TOKEN. Set it in the environment or in .env at the repo root.');
     process.exit(1);
   }
   
@@ -2629,11 +2823,10 @@ async function main() {
     // Show distribution of WS Hostname, WS Backend, POST Backend, POST Hostname
     printDistribution(events);
 
-    // Fetch create-trades and keep only markup ≤ 3%
+    // Fetch create-trades and keep only markup ≤ CREATE_TRADES_MARKUP_MAX_PCT (2%)
     const { under3: marketFeedUnder3, all: allCreateTrades } = await fetchMarketFeedUnder3(client, daysBack);
     const gotIds = new Set(events.map((e) => (e.tradeId || '').trim()).filter(Boolean));
-    // Missed = create-trades ≤3%, not got, not blacklisted, price in range (30–1200). Used for chart and table.
-    const missedSnipes = marketFeedUnder3.filter((e) => {
+    const candidateMissed = marketFeedUnder3.filter((e) => {
       const tid = (e.tradeId || '').trim();
       if (gotIds.has(tid)) return false;
       if (isBlacklisted(e)) return false;
@@ -2641,13 +2834,46 @@ async function main() {
       if (price != null && (price < MISSED_PRICE_MIN || price > MISSED_PRICE_MAX)) return false;
       return true;
     });
+    let supabaseBlacklistNameSet = new Set();
+    try {
+      const creds = resolveSupabaseCredentialsForCharts();
+      if (creds.url && creds.key) {
+        const sb = createClient(creds.url, creds.key);
+        supabaseBlacklistNameSet = await fetchBlacklistItemNameSet(sb);
+        console.log(`✅ Supabase blacklist table: ${supabaseBlacklistNameSet.size} distinct item_name values`);
+      } else {
+        console.warn('⚠️ Supabase URL/key not configured — set env or config/Bot1/Bot1_config.json (blacklist category disabled)');
+      }
+    } catch (err) {
+      console.warn('⚠️ Supabase blacklist fetch failed:', err.message || err);
+    }
+    let heartbeatSnapshots = [];
+    try {
+      heartbeatSnapshots = await fetchSnipesHeartbeatSnapshots(client, daysBack);
+    } catch (err) {
+      console.warn('⚠️ Snipes console heartbeats unavailable (not-eligible split disabled):', err.message || err);
+    }
+    const hbSorted = [...heartbeatSnapshots].sort((a, b) => a.timestamp - b.timestamp);
+    const missedSnipes = [];
+    const ineligibleSnipes = [];
+    const supabaseBlacklistSnipes = [];
+    for (const e of candidateMissed) {
+      if (isSupabaseItemBlacklisted(e, supabaseBlacklistNameSet)) {
+        supabaseBlacklistSnipes.push(e);
+        continue;
+      }
+      const price = parsePriceFromMarketFeed(e);
+      const cap = maxBalanceUsdAtTime(hbSorted, e.timestamp);
+      if (cap != null && price != null && price > cap) ineligibleSnipes.push(e);
+      else missedSnipes.push(e);
+    }
     const blacklistedCount = marketFeedUnder3.filter((e) => !gotIds.has((e.tradeId || '').trim()) && isBlacklisted(e)).length;
     const outOfRangeCount = marketFeedUnder3.filter((e) => {
       if (gotIds.has((e.tradeId || '').trim()) || isBlacklisted(e)) return false;
       const price = parsePriceFromMarketFeed(e);
       return price != null && (price < MISSED_PRICE_MIN || price > MISSED_PRICE_MAX);
     }).length;
-    console.log(`\n📉 Missed snipes (create-trades ≤3%, not in trade-success, not blacklisted, price ${MISSED_PRICE_MIN}–${MISSED_PRICE_MAX}): ${missedSnipes.length}`);
+    console.log(`\n📉 Missed (eligible) + Supabase blacklist + not eligible: ${missedSnipes.length} + ${supabaseBlacklistSnipes.length} + ${ineligibleSnipes.length} (create-trades ≤${CREATE_TRADES_MARKUP_MAX_PCT}%, not got, not hardcoded-blacklisted, price ${MISSED_PRICE_MIN}–${MISSED_PRICE_MAX})`);
     if (blacklistedCount > 0) console.log(`   (Excluded ${blacklistedCount} blacklisted)`);
     if (outOfRangeCount > 0) console.log(`   (Excluded ${outOfRangeCount} outside price range ${MISSED_PRICE_MIN}–${MISSED_PRICE_MAX})`);
 
@@ -2665,7 +2891,11 @@ async function main() {
       startTime: chartStartTime,
       endTime: chartEndTime,
       channelBUnder3: marketFeedUnder3,
-      allCreateTrades: allCreateTrades
+      allCreateTrades: allCreateTrades,
+      ineligibleSnipes,
+      supabaseBlacklistSnipes,
+      supabaseBlacklistNameCount: supabaseBlacklistNameSet.size,
+      heartbeatSnapshots: hbSorted
     });
     
     // Save HTML file
@@ -2726,10 +2956,13 @@ module.exports = {
   getMessageContent,
   isBlacklisted,
   fetchMessages,
-  fetchMessagesInRange,
   fetchMarketFeedUnder3,
-  generateHTML,
-  getHtml,
-  getHtmlForDateRange
+  fetchSnipesHeartbeatSnapshots,
+  parseTierHeartbeatMessage,
+  maxBalanceUsdAtTime,
+  fetchBlacklistItemNameSet,
+  isSupabaseItemBlacklisted,
+  normalizeItemNameForBlacklist,
+  generateHTML
 };
 

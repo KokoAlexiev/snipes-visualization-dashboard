@@ -5,3 +5,4 @@ node_modules/
 .netlify/
 *.log
 .DS_Store
+visualizations/snipes-by-hostname-*.html

@@ -1,6 +1,11 @@
-# Snipes dashboard
+# Snipes visualization dashboard
 
-Interactive snipes-by-hostname dashboard backed by Discord trade data, served as a Netlify web app with a Supabase cache for fast repeat loads.
+**Production:** [exodia-lkan-sniper-dashboard.netlify.app](https://exodia-lkan-sniper-dashboard.netlify.app/)  
+**Upstream repo (Netlify):** [github.com/KaloyanAleksiev4/snipes-visualization-dashboard](https://github.com/KaloyanAleksiev4/snipes-visualization-dashboard)
+
+Netlify serves `public/` and `/.netlify/functions/snipes-html` (Discord + Supabase cache). **Deploys rebuild when you push to the branch Netlify watches** (usually `main` on Kaloyan’s repo).
+
+---
 
 ## How it works
 
@@ -8,92 +13,44 @@ Interactive snipes-by-hostname dashboard backed by Discord trade data, served as
 Browser  →  public/index.html  (date picker UI)
               ↓  fetch ?start=YYYY-MM-DD&end=YYYY-MM-DD
          →  /.netlify/functions/snipes-html
-              1. Cheap Discord watermark check (newest message snowflake per channel)
-              2. Load Supabase cache row for this exact date range
-                 • HIT (watermarks match or range is fully in the past) → generateHTML from JSON
-                 • MISS / STALE → full Discord pagination → generateHTML → upsert cache
+              1. Discord watermark check per channel
+              2. Supabase cache HIT/MISS → generateHTML
               ↓
-         →  X-Snipes-Cache: HIT | MISS   (visible in browser DevTools → Network tab)
+         →  X-Snipes-Cache: HIT | MISS
 ```
-
-**Past ranges** (end date before today UTC) are cached **permanently** — no watermark check needed. Today's data is refreshed when new Discord messages arrive (detected via the cheap watermark query).
 
 ## Prerequisites
 
 - Node.js 18+
-- A Discord bot with **Message Content Intent**, in your server, with read access to trade-success and create-trades channels.
-- A Supabase project (free tier is fine).
+- Discord bot (Message Content Intent), read trade-success + create-trades
+- Supabase project
 
 ## Setup
 
-### 1. Apply Supabase SQL migration
+1. Run `sql/snipes_dashboard_cache.sql` in Supabase SQL editor.
+2. Copy `.env.example` → `.env` with `DISCORD_BOT_TOKEN`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`.
+3. `npm install` then `npm run dev` → http://localhost:8888
 
-In the Supabase SQL editor, run the contents of:
+## Offline chart generator
 
-```
-snipes-dashboard/sql/snipes_dashboard_cache.sql
-```
-
-### 2. Get env vars
-
-| Variable | Where to find it |
-|----------|-----------------|
-| `DISCORD_BOT_TOKEN` | Discord Developer Portal → your app → **Bot** → copy/reset token |
-| `SUPABASE_URL` | Supabase project **Settings → API → Project URL** |
-| `SUPABASE_SERVICE_ROLE_KEY` | Supabase project **Settings → API → service_role** (keep secret) |
-
-### 3. Local dev
+`visualizations/generate_snipes_chart.js` writes a standalone HTML report (hostname, got/missed/blacklist/not-eligible, tier heartbeats, ≤2% pool). Not used by the Netlify page directly.
 
 ```bash
-cd snipes-dashboard
-npm install
-cp .env.example .env
-# Fill in DISCORD_BOT_TOKEN, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
-npm run dev
+npm run generate-chart -- 7
 ```
 
-Open **http://localhost:8888**. The shell page loads with yesterday–today selected by default.
+Needs `DISCORD_BOT_TOKEN` and optional Supabase env for blacklist.
 
-## UI
+## Netlify deploy
 
-- **Start date / End date pickers**: pick any calendar range up to **30 days** (inclusive).
-- Default on load: **yesterday → today** (approximately the last 24 hours as a UTC calendar window).
-- A **Cached** (green) or **Live fetch** (red) badge appears after each load.
-- Inspect `X-Snipes-Cache: HIT | MISS` in DevTools → Network → Response Headers.
-
-## Deploy on Netlify
-
-1. Push `snipes-dashboard/` as its own Git repository **or** keep it inside a monorepo (set **Base directory** to `snipes-dashboard` if so).
-2. Build command: `npm run build` (or leave empty).
-3. Publish directory: `public` (relative to base).
-4. Add env vars in **Site configuration → Environment variables**:
-   - `DISCORD_BOT_TOKEN`
-   - `SUPABASE_URL`
-   - `SUPABASE_SERVICE_ROLE_KEY`
-5. **Check function timeout** — Site configuration → Functions. Fetching many days of Discord history can take minutes. Set the timeout as high as your plan allows. The `netlify.toml` requests `timeout = 900` for the `snipes-html` function.
-
-## Caching behaviour
-
-| Scenario | What happens |
-|----------|-------------|
-| Second load of the same past date range | Instant — served from Supabase, no Discord calls |
-| Second load of a range that includes today, no new Discord messages | HIT — watermarks match |
-| Load of today's date after a new trade fires in Discord | MISS — refetches, updates cache |
-| `SUPABASE_*` env vars missing | Graceful fallback — live Discord fetch every time |
+- **Publish:** `public`
+- **Functions:** `netlify/functions` (see `netlify.toml`, `snipes-html` timeout 900s)
+- Set the three env vars in Netlify UI.
 
 ## Security
 
-- `SUPABASE_SERVICE_ROLE_KEY` is server-side only. Never add it to `public/`, client code, or commit it.
-- The `snipes_dashboard_cache` table has RLS enabled with no anon policies. Only the service role key (which bypasses RLS) can read/write it.
-- Discord bot token: if ever committed to git, rotate it in the Discord Developer Portal immediately.
+Never commit `.env` or service role keys.
 
 ## API
 
-```
-GET /.netlify/functions/snipes-html?start=2026-01-01&end=2026-01-07
-```
-
-- `start` / `end`: UTC calendar dates (YYYY-MM-DD), inclusive.
-- Response headers: `X-Snipes-Cache: HIT | MISS`.
-- Max span: 30 days.
-- Legacy: `?days=N` still works (mapped to `end=today`, `start=today-(N-1)`).
+`GET /.netlify/functions/snipes-html?start=YYYY-MM-DD&end=YYYY-MM-DD` (max 30 days). Legacy `?days=N` supported.
