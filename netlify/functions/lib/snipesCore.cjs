@@ -2767,38 +2767,56 @@ async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient) {
     isFullyInPast,
     loadCache,
     upsertCache,
-    getChannelWatermark
+    getChannelWatermark,
+    todayUTC
   } = require('./snipesCache.cjs');
 
-  const { startMs: chartStartMs, endMs: chartEndMs } = dateStringToRange(startDateStr);
-  const { endMs: endDayMs }  = dateStringToRange(endDateStr);
-  const rangeStartMs = chartStartMs;
-  const rangeEndMs   = endDayMs;
-
-  // Days count for generateHTML label
+  const today = todayUTC();
+  const rangeStartMs = dateStringToRange(startDateStr).startMs;
+  const rangeEndMs   = dateStringToRange(endDateStr).endMs;
   const [sy, sm, sd] = startDateStr.split('-').map(Number);
   const [ey, em, ed] = endDateStr.split('-').map(Number);
   const daysBack = Math.round((Date.UTC(ey, em-1, ed) - Date.UTC(sy, sm-1, sd)) / 86400000) + 1;
 
-  const client = new Client({
-    intents: [
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.MessageContent
-    ]
-  });
+  // Build ordered list of all days in range
+  function nextDay(d) {
+    const dt = new Date(d + 'T00:00:00Z');
+    dt.setUTCDate(dt.getUTCDate() + 1);
+    return dt.toISOString().slice(0, 10);
+  }
+  const days = [];
+  for (let d = startDateStr; d <= endDateStr; d = nextDay(d)) days.push(d);
 
-  await client.login(DISCORD_BOT_TOKEN);
+  const todayInRange = startDateStr <= today && today <= endDateStr;
+  const allPast = isFullyInPast(endDateStr);
+
+  // --- Step 1: load per-day cache rows (no Discord needed yet) ---
+  // For past days: permanent hit. For today: check watermarks.
+  // dayData[day] = { events, allCreateTrades, heartbeatSnapshots, chartStartMs, chartEndMs }
+  const dayData = {};
+  const missedDays = [];
+
+  let wmTradeSuccess = '', wmCreateTrades = '';
+
+  // For today's watermark check we need Discord — but only if today is in range
+  // We defer the client login until we know we need it.
+  let client = null;
+
+  async function getClient() {
+    if (!client) {
+      client = new Client({
+        intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+      });
+      await client.login(DISCORD_BOT_TOKEN);
+    }
+    return client;
+  }
 
   try {
-    // --- Cheap watermark check (skip entirely for past-only ranges) ---
-    let wmTradeSuccess = '';
-    let wmCreateTrades = '';
-    const rangeIsPast = isFullyInPast(endDateStr);
-
-    if (!rangeIsPast) {
-      // Parallel watermark fetch from both channels
-      const guild = await client.guilds.fetch(GUILD_ID);
+    // If today is in range, fetch watermarks (needed to check today's cache freshness)
+    if (todayInRange && supabaseClient) {
+      const c = await getClient();
+      const guild = await c.guilds.fetch(GUILD_ID);
       const [tsChan, ctChan] = await Promise.all([
         guild.channels.fetch(TRADE_SUCCESS_CHANNEL_ID),
         guild.channels.fetch(CREATE_TRADES_CHANNEL_ID)
@@ -2809,98 +2827,56 @@ async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient) {
       ]);
     }
 
-    // --- Try cache ---
-    if (supabaseClient) {
-      const cached = await loadCache(supabaseClient, startDateStr, endDateStr);
-      if (cached) {
-        const isHit = rangeIsPast || (
+    // Check per-day cache in parallel (all Supabase reads at once)
+    const cacheResults = supabaseClient
+      ? await Promise.all(days.map(d => loadCache(supabaseClient, d, d)))
+      : days.map(() => null);
+
+    for (let i = 0; i < days.length; i++) {
+      const day = days[i];
+      const cached = cacheResults[i];
+      if (cached && cached.payload) {
+        const dayIsPast = isFullyInPast(day);
+        const isHit = dayIsPast || (
+          day === today &&
           cached.watermarkTradeSuccess === wmTradeSuccess &&
           cached.watermarkCreateTrades === wmCreateTrades
         );
         if (isHit) {
-          console.log(`[cache] HIT ${startDateStr}..${endDateStr}`);
-          const { events, missedSnipes, marketFeedUnder3, allCreateTrades, chartStartMs: cSt, chartEndMs: cEn } = cached.payload;
-          // Re-compute ineligible/blacklist splits from cached data (in parallel)
-          const [cacheHitHeartbeats, cacheHitBlacklistNameSet] = await Promise.all([
-            fetchSnipesHeartbeatSnapshots(client, daysBack).catch(() => []),
-            (supabaseClient ? fetchBlacklistItemNameSet(supabaseClient) : Promise.resolve(new Set())).catch(() => new Set())
-          ]);
-          const cacheHitHbSorted = [...cacheHitHeartbeats].sort((a, b) => a.timestamp - b.timestamp);
-          const gotIds = new Set(events.map((e) => (e.tradeId || '').trim()).filter(Boolean));
-          const cacheHitCandidates = (marketFeedUnder3 || []).filter((e) => {
-            const tid = (e.tradeId || '').trim();
-            if (gotIds.has(tid)) return false;
-            if (isBlacklisted(e)) return false;
-            const price = parsePriceFromMarketFeed(e);
-            if (price != null && (price < MISSED_PRICE_MIN || price > MISSED_PRICE_MAX)) return false;
-            return true;
-          });
-          const cacheHitMissed = [], cacheHitIneligible = [], cacheHitBlacklist = [];
-          for (const e of cacheHitCandidates) {
-            if (isSupabaseItemBlacklisted(e, cacheHitBlacklistNameSet)) { cacheHitBlacklist.push(e); continue; }
-            const price = parsePriceFromMarketFeed(e);
-            const cap = maxBalanceUsdAtTime(cacheHitHbSorted, e.timestamp);
-            if (cap != null && price != null && price > cap) cacheHitIneligible.push(e);
-            else cacheHitMissed.push(e);
-          }
-          const html = generateHTML(events, daysBack, cacheHitMissed, {
-            startTime: cSt,
-            endTime:   cEn,
-            channelBUnder3: marketFeedUnder3,
-            allCreateTrades: allCreateTrades,
-            ineligibleSnipes: cacheHitIneligible,
-            supabaseBlacklistSnipes: cacheHitBlacklist,
-            supabaseBlacklistNameCount: cacheHitBlacklistNameSet.size,
-            heartbeatSnapshots: cacheHitHbSorted
-          });
-          return { html, cacheHit: true };
+          console.log(`[cache] HIT day ${day}`);
+          dayData[day] = cached.payload;
+          continue;
         }
-        console.log(`[cache] STALE ${startDateStr}..${endDateStr} (watermarks changed)`);
+        console.log(`[cache] STALE day ${day}`);
       } else {
-        console.log(`[cache] MISS ${startDateStr}..${endDateStr}`);
+        console.log(`[cache] MISS day ${day}`);
       }
+      missedDays.push(day);
     }
 
-    // --- Full Discord fetch (all 3 channels + Supabase blacklist in parallel) ---
-    const [events, allCreateTrades, heartbeatSnapshots, supabaseBlacklistNameSet] = await Promise.all([
-      fetchMessagesInRange(client, rangeStartMs, rangeEndMs, TRADE_SUCCESS_CHANNEL_ID),
-      fetchMessagesInRange(client, rangeStartMs, rangeEndMs, CREATE_TRADES_CHANNEL_ID),
-      fetchSnipesHeartbeatSnapshots(client, daysBack).catch(err => {
-        console.warn('⚠️ Snipes console heartbeats unavailable (not-eligible split disabled):', err.message || err);
-        return [];
-      }),
-      (supabaseClient ? fetchBlacklistItemNameSet(supabaseClient) : Promise.resolve(new Set())).catch(err => {
-        console.warn('⚠️ Supabase blacklist fetch failed:', err.message || err);
-        return new Set();
-      })
-    ]);
-    const marketFeedUnder3 = filterCreateTradesMarkupAtMost3(allCreateTrades);
-    const gotIds = new Set(events.map((e) => (e.tradeId || '').trim()).filter(Boolean));
-    const candidateMissed = marketFeedUnder3.filter((e) => {
-      const tid = (e.tradeId || '').trim();
-      if (gotIds.has(tid)) return false;
-      if (isBlacklisted(e)) return false;
-      const price = parsePriceFromMarketFeed(e);
-      if (price != null && (price < MISSED_PRICE_MIN || price > MISSED_PRICE_MAX)) return false;
-      return true;
-    });
-    const hbSorted = [...heartbeatSnapshots].sort((a, b) => a.timestamp - b.timestamp);
-    const missedSnipes = [], ineligibleSnipes = [], supabaseBlacklistSnipes = [];
-    for (const e of candidateMissed) {
-      if (isSupabaseItemBlacklisted(e, supabaseBlacklistNameSet)) { supabaseBlacklistSnipes.push(e); continue; }
-      const price = parsePriceFromMarketFeed(e);
-      const cap = maxBalanceUsdAtTime(hbSorted, e.timestamp);
-      if (cap != null && price != null && price > cap) ineligibleSnipes.push(e);
-      else missedSnipes.push(e);
-    }
-    console.log(`\n📉 Missed (eligible) + Supabase blacklist + not eligible: ${missedSnipes.length} + ${supabaseBlacklistSnipes.length} + ${ineligibleSnipes.length} (create-trades ≤${CREATE_TRADES_MARKUP_MAX_PCT}%)`);
+    const fullCacheHit = missedDays.length === 0;
 
-    // --- Upsert cache ---
-    if (supabaseClient) {
-      // Get watermarks for current-day ranges if not fetched yet
-      if (rangeIsPast) {
+    // --- Step 2: fetch Discord only for missed days ---
+    if (missedDays.length > 0) {
+      const missedStartMs = dateStringToRange(missedDays[0]).startMs;
+      const missedEndMs   = dateStringToRange(missedDays[missedDays.length - 1]).endMs;
+      const missedDaysBack = missedDays.length;
+      const c = await getClient();
+
+      // Fetch trade-success, create-trades and heartbeats for missed range all in parallel
+      const [fetchedEvents, fetchedAllCreateTrades, fetchedHeartbeats] = await Promise.all([
+        fetchMessagesInRange(c, missedStartMs, missedEndMs, TRADE_SUCCESS_CHANNEL_ID),
+        fetchMessagesInRange(c, missedStartMs, missedEndMs, CREATE_TRADES_CHANNEL_ID),
+        fetchSnipesHeartbeatSnapshots(c, missedDaysBack).catch(err => {
+          console.warn('⚠️ Heartbeats unavailable:', err.message || err);
+          return [];
+        })
+      ]);
+
+      // Watermarks for past days (needed for cache upsert)
+      if (allPast && supabaseClient) {
         try {
-          const guild = await client.guilds.fetch(GUILD_ID);
+          const guild = await c.guilds.fetch(GUILD_ID);
           const [tsChan, ctChan] = await Promise.all([
             guild.channels.fetch(TRADE_SUCCESS_CHANNEL_ID),
             guild.channels.fetch(CREATE_TRADES_CHANNEL_ID)
@@ -2911,14 +2887,68 @@ async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient) {
           ]);
         } catch (_) {}
       }
-      await upsertCache(supabaseClient, startDateStr, endDateStr, {
-        events, missedSnipes, marketFeedUnder3, allCreateTrades,
-        chartStartMs: rangeStartMs,
-        chartEndMs:   rangeEndMs
-      }, wmTradeSuccess, wmCreateTrades);
+
+      // Split fetched data by day, cache each missed day individually
+      const upsertPromises = [];
+      for (const day of missedDays) {
+        const { startMs, endMs } = dateStringToRange(day);
+        const dayEvents        = fetchedEvents.filter(e => e.timestamp >= startMs && e.timestamp <= endMs);
+        const dayCreateTrades  = fetchedAllCreateTrades.filter(e => e.timestamp >= startMs && e.timestamp <= endMs);
+        const dayHeartbeats    = fetchedHeartbeats.filter(s => s.timestamp >= startMs && s.timestamp <= endMs);
+        dayData[day] = { events: dayEvents, allCreateTrades: dayCreateTrades, heartbeatSnapshots: dayHeartbeats, chartStartMs: startMs, chartEndMs: endMs };
+        if (supabaseClient) {
+          const dayWmTs = (day === today) ? wmTradeSuccess : '';
+          const dayWmCt = (day === today) ? wmCreateTrades : '';
+          upsertPromises.push(
+            upsertCache(supabaseClient, day, day, {
+              events: dayEvents,
+              missedSnipes: [],
+              marketFeedUnder3: filterCreateTradesMarkupAtMost3(dayCreateTrades),
+              allCreateTrades: dayCreateTrades,
+              heartbeatSnapshots: dayHeartbeats,
+              chartStartMs: startMs,
+              chartEndMs: endMs
+            }, dayWmTs, dayWmCt)
+          );
+        }
+      }
+      // Fire-and-forget cache writes (don't block response)
+      Promise.all(upsertPromises).catch(err => console.warn('[cache] upsert error:', err.message));
     }
 
-    const html = generateHTML(events, daysBack, missedSnipes, {
+    // --- Step 3: combine all days ---
+    const allEvents       = days.flatMap(d => (dayData[d] && dayData[d].events)       || []);
+    const allCreateTrades = days.flatMap(d => (dayData[d] && dayData[d].allCreateTrades) || []);
+    const allHeartbeats   = days.flatMap(d => (dayData[d] && dayData[d].heartbeatSnapshots) || []);
+    const hbSorted = [...allHeartbeats].sort((a, b) => a.timestamp - b.timestamp);
+
+    // --- Step 4: Supabase blacklist (fast ~100ms, don't need Discord) ---
+    const supabaseBlacklistNameSet = await (
+      supabaseClient ? fetchBlacklistItemNameSet(supabaseClient) : Promise.resolve(new Set())
+    ).catch(err => { console.warn('⚠️ Supabase blacklist fetch failed:', err.message); return new Set(); });
+
+    // --- Step 5: compute missed / ineligible / blacklist ---
+    const marketFeedUnder3 = filterCreateTradesMarkupAtMost3(allCreateTrades);
+    const gotIds = new Set(allEvents.map(e => (e.tradeId || '').trim()).filter(Boolean));
+    const candidateMissed = marketFeedUnder3.filter(e => {
+      const tid = (e.tradeId || '').trim();
+      if (gotIds.has(tid)) return false;
+      if (isBlacklisted(e)) return false;
+      const price = parsePriceFromMarketFeed(e);
+      if (price != null && (price < MISSED_PRICE_MIN || price > MISSED_PRICE_MAX)) return false;
+      return true;
+    });
+    const missedSnipes = [], ineligibleSnipes = [], supabaseBlacklistSnipes = [];
+    for (const e of candidateMissed) {
+      if (isSupabaseItemBlacklisted(e, supabaseBlacklistNameSet)) { supabaseBlacklistSnipes.push(e); continue; }
+      const price = parsePriceFromMarketFeed(e);
+      const cap = maxBalanceUsdAtTime(hbSorted, e.timestamp);
+      if (cap != null && price != null && price > cap) ineligibleSnipes.push(e);
+      else missedSnipes.push(e);
+    }
+    console.log(`📉 Missed: ${missedSnipes.length} + Blacklist: ${supabaseBlacklistSnipes.length} + NotEligible: ${ineligibleSnipes.length} (cacheHit=${fullCacheHit})`);
+
+    const html = generateHTML(allEvents, daysBack, missedSnipes, {
       startTime: rangeStartMs,
       endTime:   rangeEndMs,
       channelBUnder3: marketFeedUnder3,
@@ -2928,9 +2958,9 @@ async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient) {
       supabaseBlacklistNameCount: supabaseBlacklistNameSet.size,
       heartbeatSnapshots: hbSorted
     });
-    return { html, cacheHit: false };
+    return { html, cacheHit: fullCacheHit };
   } finally {
-    await client.destroy().catch(() => {});
+    if (client) await client.destroy().catch(() => {});
   }
 }
 

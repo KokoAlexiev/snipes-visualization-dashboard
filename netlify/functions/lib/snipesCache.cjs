@@ -3,7 +3,8 @@
 const { createClient } = require('@supabase/supabase-js');
 
 // Bump this when the event schema or generateHTML logic changes so old rows are ignored.
-const CACHE_SCHEMA_VERSION = 1;
+// v2: per-day caching; payload now includes heartbeatSnapshots so no Discord call on cache hit.
+const CACHE_SCHEMA_VERSION = 2;
 
 const TABLE = 'snipes_dashboard_cache';
 
@@ -46,9 +47,10 @@ function createSupabaseClient() {
 
 /**
  * Serialize the in-memory payload into a JSON-safe object.
- * Strips `date` (Date objects, not needed by generateHTML) and truncates rawContent.
+ * Strips `date` (Date objects) and truncates rawContent.
+ * heartbeatSnapshots: array of { timestamp, maxUsd } — stored so cache hits need no Discord call.
  */
-function serializePayload(events, missedSnipes, marketFeedUnder3, allCreateTrades, chartStartMs, chartEndMs) {
+function serializePayload(events, missedSnipes, marketFeedUnder3, allCreateTrades, chartStartMs, chartEndMs, heartbeatSnapshots) {
   const stripEvent = (e) => {
     const { date: _d, ...rest } = e;
     if (rest.rawContent) rest.rawContent = String(rest.rawContent).substring(0, 300);
@@ -58,10 +60,11 @@ function serializePayload(events, missedSnipes, marketFeedUnder3, allCreateTrade
     schemaVersion: CACHE_SCHEMA_VERSION,
     chartStartMs,
     chartEndMs,
-    events:          (events          || []).map(stripEvent),
-    missedSnipes:    (missedSnipes    || []).map(stripEvent),
-    marketFeedUnder3:(marketFeedUnder3|| []).map(stripEvent),
-    allCreateTrades: (allCreateTrades || []).map(stripEvent)
+    events:             (events          || []).map(stripEvent),
+    missedSnipes:       (missedSnipes    || []).map(stripEvent),
+    marketFeedUnder3:   (marketFeedUnder3|| []).map(stripEvent),
+    allCreateTrades:    (allCreateTrades || []).map(stripEvent),
+    heartbeatSnapshots: (heartbeatSnapshots || []).map(s => ({ timestamp: s.timestamp, maxUsd: s.maxUsd }))
   };
 }
 
@@ -72,12 +75,13 @@ function serializePayload(events, missedSnipes, marketFeedUnder3, allCreateTrade
 function deserializePayload(raw) {
   if (!raw || raw.schemaVersion !== CACHE_SCHEMA_VERSION) return null;
   return {
-    chartStartMs:     raw.chartStartMs,
-    chartEndMs:       raw.chartEndMs,
-    events:           raw.events           || [],
-    missedSnipes:     raw.missedSnipes     || [],
-    marketFeedUnder3: raw.marketFeedUnder3 || [],
-    allCreateTrades:  raw.allCreateTrades  || []
+    chartStartMs:       raw.chartStartMs,
+    chartEndMs:         raw.chartEndMs,
+    events:             raw.events             || [],
+    missedSnipes:       raw.missedSnipes       || [],
+    marketFeedUnder3:   raw.marketFeedUnder3   || [],
+    allCreateTrades:    raw.allCreateTrades    || [],
+    heartbeatSnapshots: raw.heartbeatSnapshots || []
   };
 }
 
@@ -120,7 +124,8 @@ async function upsertCache(supabase, startDateStr, endDateStr, payloadObj, wmTra
       payloadObj.marketFeedUnder3,
       payloadObj.allCreateTrades,
       payloadObj.chartStartMs,
-      payloadObj.chartEndMs
+      payloadObj.chartEndMs,
+      payloadObj.heartbeatSnapshots
     );
     const { error } = await supabase
       .from(TABLE)
