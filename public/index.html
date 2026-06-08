@@ -268,14 +268,31 @@
           .then(function (res) {
             if (generation !== loadGeneration) return null;
             var hit = res.headers.get('X-Snipes-Cache');
-            cacheBadge.className = 'cache-badge ' + (hit === 'HIT' ? 'hit' : 'miss');
-            cacheBadge.textContent = hit === 'HIT' ? 'Cached' : 'Live fetch';
+            if (hit === 'WARMING') {
+              cacheBadge.className = 'cache-badge';
+              cacheBadge.textContent = '';
+            } else {
+              cacheBadge.className = 'cache-badge ' + (hit === 'HIT' ? 'hit' : 'miss');
+              cacheBadge.textContent = hit === 'HIT' ? 'Cached' : 'Live fetch';
+            }
             return res.text().then(function (html) {
-              return { ok: res.ok, status: res.status, html: html };
+              return { ok: res.ok, status: res.status, html: html, cache: hit };
             });
           })
           .then(function (payload) {
             if (!payload || generation !== loadGeneration) return;
+
+            // Cache is being built server-side — keep the spinner and retry shortly.
+            if (payload.cache === 'WARMING') {
+              var lt = loading.querySelector('.loading-text');
+              if (lt) lt.textContent = 'Preparing data… (this can take up to a minute)';
+              setLoading(true, start, end);
+              setTimeout(function () {
+                if (generation === loadGeneration) doLoad();
+              }, 6000);
+              return;
+            }
+
             if (!payload.ok) {
               setLoading(false);
               dash.removeAttribute('srcdoc');

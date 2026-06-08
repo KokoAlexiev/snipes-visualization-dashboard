@@ -2916,8 +2916,9 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
  * supabaseClient: optional Supabase client (from snipesCache.cjs) — pass null to skip caching.
  * Returns { html, cacheHit }
  */
-async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient) {
-  if (!DISCORD_BOT_TOKEN) {
+async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient, opts = {}) {
+  // Request path (noBuild) never touches Discord, so the token isn't required there.
+  if (!opts.noBuild && !DISCORD_BOT_TOKEN) {
     throw new Error('Missing DISCORD_BOT_TOKEN environment variable');
   }
 
@@ -2988,24 +2989,41 @@ async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient) {
   }
 
   try {
-    // --- Step 1: Supabase cache only (no Discord yet) ---
+    // --- Step 1: Supabase cache (no Discord) ---
     const cacheResults = supabaseClient
       ? await Promise.all(days.map(d => loadCache(supabaseClient, d, d)))
       : days.map(() => null);
 
-    const todayPending = [];
+    const freshTtlMs = opts.freshTtlMs != null ? opts.freshTtlMs : 5 * 60 * 1000;
+    let staleToday = false;
 
     for (let i = 0; i < days.length; i++) {
       const day = days[i];
       const cached = cacheResults[i];
+      const isToday = day === today;
+
       if (cached && cached.payload) {
         if (isFullyInPast(day)) {
           console.log(`[cache] HIT day ${day} (past)`);
           dayData[day] = cached.payload;
           continue;
         }
-        if (day === today) {
-          todayPending.push(cached);
+        if (isToday) {
+          if (opts.forceToday) {
+            // Background refresh path: rebuild today from Discord
+            console.log(`[cache] FORCE rebuild day ${day} (today)`);
+            missedDays.push(day);
+            continue;
+          }
+          // Serve cached "today" immediately; flag for background revalidation if old
+          const builtMs = cached.builtAt ? Date.parse(cached.builtAt) : 0;
+          if (!builtMs || (Date.now() - builtMs) > freshTtlMs) {
+            staleToday = true;
+            console.log(`[cache] SERVE STALE day ${day} (today) — will revalidate in background`);
+          } else {
+            console.log(`[cache] HIT day ${day} (today, fresh)`);
+          }
+          dayData[day] = cached.payload;
           continue;
         }
       }
@@ -3013,38 +3031,21 @@ async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient) {
       missedDays.push(day);
     }
 
-    // --- Step 2: validate today's row with Discord watermarks (only if cached) ---
-    if (todayPending.length > 0) {
-      if (supabaseClient) {
-        const c = await getClient();
-        const prefetch = await getDiscordPrefetch(c);
-        [wmTradeSuccess, wmCreateTrades] = await Promise.all([
-          getChannelWatermark(prefetch.channels[TRADE_SUCCESS_CHANNEL_ID]),
-          getChannelWatermark(prefetch.channels[CREATE_TRADES_CHANNEL_ID])
-        ]);
-        const cached = todayPending[0];
-        if (cached.watermarkTradeSuccess === wmTradeSuccess &&
-            cached.watermarkCreateTrades === wmCreateTrades) {
-          console.log(`[cache] HIT day ${today} (today, fresh)`);
-          dayData[today] = cached.payload;
-        } else {
-          console.log(`[cache] STALE day ${today}`);
-          if (!missedDays.includes(today)) missedDays.push(today);
-        }
-      } else if (!missedDays.includes(today)) {
-        missedDays.push(today);
-      }
+    // Request path never runs Discord — bail out so the caller can warm in the background.
+    if (opts.noBuild && missedDays.length > 0) {
+      return { needsBuild: true, missingDays: missedDays.slice() };
     }
 
-    const fullCacheHit = missedDays.length === 0;
+    const fullCacheHit = missedDays.length === 0 && !staleToday;
 
-    // --- Step 3: fetch Discord only for missed days ---
+    // --- Step 2: fetch Discord only for missed days (build / background path) ---
     if (missedDays.length > 0) {
       const missedStartMs = dateStringToRange(missedDays[0]).startMs;
       const missedEndMs   = dateStringToRange(missedDays[missedDays.length - 1]).endMs;
       const c = await getClient();
       const prefetch = await getDiscordPrefetch(c);
-      const perDayConcurrency = Math.max(6, Math.floor(fetchConcurrency() / missedDays.length));
+      const buildConcurrency = opts.concurrency || fetchConcurrency();
+      const perDayConcurrency = Math.max(4, Math.floor(buildConcurrency / missedDays.length));
 
       const rangeResults = await Promise.all(missedDays.map(async (day) => {
         const { startMs, endMs } = dateStringToRange(day);
@@ -3147,7 +3148,7 @@ async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient) {
       supabaseBlacklistNameCount: supabaseBlacklistNameSet.size,
       heartbeatSnapshots: hbSorted
     });
-    return { html, cacheHit: fullCacheHit };
+    return { html, cacheHit: fullCacheHit, stale: staleToday };
   } finally {
     if (client) await client.destroy().catch(() => {});
   }

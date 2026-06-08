@@ -3,20 +3,63 @@
 const { getHtmlForDateRange } = require('./lib/snipesCore.cjs');
 const { createSupabaseClient, todayUTC } = require('./lib/snipesCache.cjs');
 
-/** Coalesce concurrent identical range requests (avoids duplicate Discord backfills). */
+const COMMON_HEADERS = {
+  'Content-Type':   'text/html; charset=utf-8',
+  'X-Frame-Options':'SAMEORIGIN',
+  'Cache-Control':  'private, no-cache'
+};
+
+/** Coalesce concurrent identical range requests (cheap cache reads, but avoids piling up). */
 const inflightRequests = new Map();
+
+/** Throttle background warm triggers per range so we don't spam the background function. */
+const lastWarmTrigger = new Map();
+const WARM_TRIGGER_THROTTLE_MS = 30 * 1000;
 
 function getHtmlForDateRangeDeduped(startDateStr, endDateStr, supabase) {
   const key = `${startDateStr}|${endDateStr}`;
   if (inflightRequests.has(key)) {
-    console.log(`[snipes-html] coalescing in-flight request ${key}`);
     return inflightRequests.get(key);
   }
-  const promise = getHtmlForDateRange(startDateStr, endDateStr, supabase).finally(() => {
+  // Request path: read cache only, never run Discord (so it can't time out).
+  const promise = getHtmlForDateRange(startDateStr, endDateStr, supabase, { noBuild: true }).finally(() => {
     inflightRequests.delete(key);
   });
   inflightRequests.set(key, promise);
   return promise;
+}
+
+/** Fire a background rebuild of the cache for this range (does not block the response). */
+async function triggerBackgroundWarm(startDateStr, endDateStr) {
+  const key = `${startDateStr}|${endDateStr}`;
+  const now = Date.now();
+  const last = lastWarmTrigger.get(key) || 0;
+  if (now - last < WARM_TRIGGER_THROTTLE_MS) return;
+  lastWarmTrigger.set(key, now);
+
+  const base = process.env.URL || process.env.DEPLOY_PRIME_URL || process.env.DEPLOY_URL || '';
+  if (!base) {
+    console.warn('[snipes-html] no site URL env — cannot trigger background warm');
+    return;
+  }
+  try {
+    // Background functions return 202 immediately, so awaiting this is fast.
+    await fetch(`${base}/.netlify/functions/snipes-warm-background`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ start: startDateStr, end: endDateStr })
+    });
+    console.log(`[snipes-html] triggered background warm ${key}`);
+  } catch (err) {
+    console.warn('[snipes-html] background warm trigger failed:', err && err.message);
+  }
+}
+
+function warmingPage(startDateStr, endDateStr) {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Preparing…</title></head>` +
+    `<body style="font-family:sans-serif;padding:2rem;background:#1a1b26;color:#c0caf5;">` +
+    `<h1>Preparing snipes data…</h1><p>Building the cache for ${startDateStr} → ${endDateStr}. ` +
+    `This page will refresh automatically.</p></body></html>`;
 }
 
 /** Validate a YYYY-MM-DD string; return true if well-formed. */
@@ -77,17 +120,30 @@ exports.handler = async (event) => {
     }
 
     const supabase = createSupabaseClient();
-    const { html, cacheHit } = await getHtmlForDateRangeDeduped(startDateStr, endDateStr, supabase);
+    const result = await getHtmlForDateRangeDeduped(startDateStr, endDateStr, supabase);
+
+    // Cache missing for one or more days — kick off a background build and tell the client to retry.
+    if (result.needsBuild) {
+      await triggerBackgroundWarm(startDateStr, endDateStr);
+      return {
+        statusCode: 200,
+        headers: { ...COMMON_HEADERS, 'X-Snipes-Cache': 'WARMING' },
+        body: warmingPage(startDateStr, endDateStr)
+      };
+    }
+
+    // Served from cache. If today's slice is stale, refresh it in the background (non-blocking).
+    if (result.stale) {
+      await triggerBackgroundWarm(startDateStr, endDateStr);
+    }
 
     return {
       statusCode: 200,
       headers: {
-        'Content-Type':   'text/html; charset=utf-8',
-        'X-Frame-Options':'SAMEORIGIN',
-        'Cache-Control':  'private, no-cache',
-        'X-Snipes-Cache': cacheHit ? 'HIT' : 'MISS'
+        ...COMMON_HEADERS,
+        'X-Snipes-Cache': result.cacheHit ? 'HIT' : 'STALE'
       },
-      body: html
+      body: result.html
     };
   } catch (err) {
     console.error('snipes-html error:', err);

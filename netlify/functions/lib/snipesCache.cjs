@@ -94,7 +94,7 @@ async function loadCache(supabase, startDateStr, endDateStr) {
   try {
     const { data, error } = await supabase
       .from(TABLE)
-      .select('payload, watermark_trade_success, watermark_create_trades, content_version')
+      .select('payload, watermark_trade_success, watermark_create_trades, content_version, built_at')
       .eq('start_date', startDateStr)
       .eq('end_date',   endDateStr)
       .single();
@@ -104,7 +104,8 @@ async function loadCache(supabase, startDateStr, endDateStr) {
     return {
       payload,
       watermarkTradeSuccess: data.watermark_trade_success,
-      watermarkCreateTrades: data.watermark_create_trades
+      watermarkCreateTrades: data.watermark_create_trades,
+      builtAt: data.built_at
     };
   } catch (err) {
     console.warn('[snipesCache] loadCache error:', err && err.message);
