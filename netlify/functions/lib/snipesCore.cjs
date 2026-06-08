@@ -421,10 +421,183 @@ function maxBalanceUsdAtTime(sortedSnapshots, timeMs) {
   return ans;
 }
 
+const DISCORD_EPOCH_MS = 1420070400000n;
+/** Default 1h windows; override with DISCORD_FETCH_WINDOW_MS (ms). */
+const DEFAULT_FETCH_WINDOW_MS = 60 * 60 * 1000;
+/** Max parallel Discord page fetches per channel; override with DISCORD_FETCH_CONCURRENCY. */
+const DEFAULT_FETCH_CONCURRENCY = 16;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function fetchWindowMs() {
+  const raw = parseInt(process.env.DISCORD_FETCH_WINDOW_MS || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_FETCH_WINDOW_MS;
+}
+
+function fetchConcurrency() {
+  const raw = parseInt(process.env.DISCORD_FETCH_CONCURRENCY || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_FETCH_CONCURRENCY;
+}
+
+/** Discord snowflake for the first ID strictly after `ms` (for `before` pagination). */
+function msToSnowflakeBefore(ms) {
+  const t = BigInt(Math.max(0, Math.floor(ms) + 1 - Number(DISCORD_EPOCH_MS)));
+  return (t << 22n).toString();
+}
+
+function splitRangeIntoWindows(rangeStartMs, rangeEndMs, windowMs) {
+  const windows = [];
+  for (let start = rangeStartMs; start <= rangeEndMs; ) {
+    const end = Math.min(start + windowMs - 1, rangeEndMs);
+    windows.push({ startMs: start, endMs: end });
+    start = end + 1;
+  }
+  return windows;
+}
+
+async function asyncPool(concurrency, items, fn) {
+  if (items.length === 0) return [];
+  const results = new Array(items.length);
+  let nextIdx = 0;
+  async function worker() {
+    while (nextIdx < items.length) {
+      const i = nextIdx++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, items.length) }, () => worker())
+  );
+  return results;
+}
+
+async function fetchMessagesPage(channel, options) {
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      return await channel.messages.fetch(options);
+    } catch (err) {
+      const status = err && (err.status ?? err.httpStatus ?? err.code);
+      const retryAfterSec = err && (err.retryAfter ?? err.data?.retry_after ?? err.rawError?.retry_after);
+      if (status !== 429 || attempt === 5) throw err;
+      const waitMs = Math.ceil((typeof retryAfterSec === 'number' ? retryAfterSec : attempt + 1) * 1000) + 50;
+      console.warn(`[discord] 429 rate limit — retry in ${waitMs}ms`);
+      await sleep(waitMs);
+    }
+  }
+}
+
+/**
+ * Paginate backwards within one time window using a snowflake `before` cursor.
+ */
+async function fetchChannelWindow(channel, windowStartMs, windowEndMs, parseFn) {
+  const events = [];
+  let beforeId = msToSnowflakeBefore(windowEndMs);
+  let hasMore = true;
+
+  while (hasMore) {
+    const messages = await fetchMessagesPage(channel, { limit: 100, before: beforeId });
+    if (messages.size === 0) break;
+
+    let hitWindowStart = false;
+    for (const message of messages.values()) {
+      if (message.createdTimestamp < windowStartMs) {
+        hitWindowStart = true;
+        break;
+      }
+      if (message.createdTimestamp > windowEndMs) continue;
+      const event = parseFn(message);
+      if (event) events.push(event);
+    }
+
+    if (hitWindowStart || messages.size < 100) break;
+    beforeId = messages.last().id;
+  }
+  return events;
+}
+
+function dedupeParsedEvents(events) {
+  const seen = new Set();
+  const out = [];
+  for (const e of events) {
+    const key = `${e.tradeId || ''}|${e.timestamp}|${e.itemName || ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(e);
+  }
+  return out;
+}
+
+/**
+ * Fetch trade-success, create-trades and heartbeats for one time range using
+ * snowflake-window pagination with a shared concurrency pool.
+ */
+async function fetchDiscordRangeParallel(prefetch, rangeStartMs, rangeEndMs, concurrency) {
+  const windowMs = fetchWindowMs();
+  const windows = splitRangeIntoWindows(rangeStartMs, rangeEndMs, windowMs);
+  const tasks = [];
+
+  for (const win of windows) {
+    tasks.push({ kind: 'trade', channelId: TRADE_SUCCESS_CHANNEL_ID, parseFn: parseTradeMessage, win });
+    tasks.push({ kind: 'create', channelId: CREATE_TRADES_CHANNEL_ID, parseFn: parseMarketFeedMessage, win });
+    tasks.push({ kind: 'heartbeat', win });
+  }
+
+  const rangeLabel = `${new Date(rangeStartMs).toISOString().slice(0, 10)}..${new Date(rangeEndMs).toISOString().slice(0, 10)}`;
+  console.log(`📥 Parallel Discord fetch (${rangeLabel}): ${windows.length} windows × 3 streams, concurrency ${concurrency}`);
+
+  const hbChannel = prefetch.channels[SNIPES_CONSOLE_CHANNEL_ID];
+  const taskResults = await asyncPool(concurrency, tasks, async (task) => {
+    if (task.kind === 'heartbeat') {
+      const snapshots = [];
+      let beforeId = msToSnowflakeBefore(task.win.endMs);
+      let hasMore = true;
+      while (hasMore) {
+        const messages = await fetchMessagesPage(hbChannel, { limit: 100, before: beforeId });
+        if (messages.size === 0) break;
+        let hitWindowStart = false;
+        for (const message of messages.values()) {
+          if (message.createdTimestamp < task.win.startMs) {
+            hitWindowStart = true;
+            break;
+          }
+          if (message.createdTimestamp > task.win.endMs) continue;
+          const snap = parseTierHeartbeatMessage(message);
+          if (snap) snapshots.push(snap);
+        }
+        if (hitWindowStart || messages.size < 100) break;
+        beforeId = messages.last().id;
+      }
+      return { kind: 'heartbeat', data: snapshots };
+    }
+    const channel = prefetch.channels[task.channelId];
+    const data = await fetchChannelWindow(channel, task.win.startMs, task.win.endMs, task.parseFn);
+    return { kind: task.kind, data };
+  });
+
+  const events = dedupeParsedEvents(taskResults.filter((r) => r.kind === 'trade').flatMap((r) => r.data));
+  const allCreateTrades = dedupeParsedEvents(taskResults.filter((r) => r.kind === 'create').flatMap((r) => r.data));
+  const hbByTs = new Map();
+  for (const r of taskResults) {
+    if (r.kind !== 'heartbeat') continue;
+    for (const snap of r.data) hbByTs.set(snap.timestamp, snap);
+  }
+  const heartbeats = [...hbByTs.values()].sort((a, b) => a.timestamp - b.timestamp);
+  return { events, allCreateTrades, heartbeats };
+}
+
 /**
  * Fetch tier heartbeats from Snipes console for max-balance time series.
+ * @deprecated use fetchSnipesHeartbeatSnapshotsInRange
  */
 async function fetchSnipesHeartbeatSnapshots(client, daysBack = 7, prefetch = null) {
+  const rangeEndMs = Date.now();
+  const rangeStartMs = rangeEndMs - daysBack * 24 * 60 * 60 * 1000;
+  return fetchSnipesHeartbeatSnapshotsInRange(client, rangeStartMs, rangeEndMs, prefetch);
+}
+
+async function fetchSnipesHeartbeatSnapshotsInRange(client, rangeStartMs, rangeEndMs, prefetch = null) {
   let channel;
   if (prefetch && prefetch.channels && prefetch.channels[SNIPES_CONSOLE_CHANNEL_ID]) {
     channel = prefetch.channels[SNIPES_CONSOLE_CHANNEL_ID];
@@ -437,35 +610,41 @@ async function fetchSnipesHeartbeatSnapshots(client, daysBack = 7, prefetch = nu
   if (!channel) {
     throw new Error(`Channel ${SNIPES_CONSOLE_CHANNEL_ID} not found`);
   }
-  const snapshots = [];
-  const cutoffTime = Date.now() - daysBack * 24 * 60 * 60 * 1000;
-  let lastMessageId = null;
-  let hasMore = true;
-  let fetchedCount = 0;
-  console.log(`📥 Fetching Snipes console heartbeats (${SNIPES_CONSOLE_CHANNEL_ID}, last ${daysBack} days)...`);
-  while (hasMore) {
-    const options = { limit: 100 };
-    if (lastMessageId) options.before = lastMessageId;
-    const messages = await channel.messages.fetch(options);
-    fetchedCount += messages.size;
-    if (messages.size === 0) {
-      hasMore = false;
-      break;
-    }
-    for (const message of messages.values()) {
-      if (message.createdTimestamp < cutoffTime) {
-        hasMore = false;
-        break;
+
+  const windowMs = fetchWindowMs();
+  const windows = splitRangeIntoWindows(rangeStartMs, rangeEndMs, windowMs);
+  const rangeLabel = `${new Date(rangeStartMs).toISOString().slice(0, 10)}..${new Date(rangeEndMs).toISOString().slice(0, 10)}`;
+  console.log(`📥 Fetching Snipes console heartbeats (${SNIPES_CONSOLE_CHANNEL_ID}, ${rangeLabel}, ${windows.length} parallel windows)...`);
+
+  const windowResults = await asyncPool(fetchConcurrency(), windows, async (win) => {
+    const snapshots = [];
+    let beforeId = msToSnowflakeBefore(win.endMs);
+    let hasMore = true;
+    while (hasMore) {
+      const messages = await fetchMessagesPage(channel, { limit: 100, before: beforeId });
+      if (messages.size === 0) break;
+      let hitWindowStart = false;
+      for (const message of messages.values()) {
+        if (message.createdTimestamp < win.startMs) {
+          hitWindowStart = true;
+          break;
+        }
+        if (message.createdTimestamp > win.endMs) continue;
+        const snap = parseTierHeartbeatMessage(message);
+        if (snap) snapshots.push(snap);
       }
-      const snap = parseTierHeartbeatMessage(message);
-      if (snap) snapshots.push(snap);
+      if (hitWindowStart || messages.size < 100) break;
+      beforeId = messages.last().id;
     }
-    if (messages.size < 100) hasMore = false;
-    else lastMessageId = messages.last().id;
-    console.log(`   Heartbeat fetch: ${fetchedCount} messages, ${snapshots.length} tier snapshots...`);
+    return snapshots;
+  });
+
+  const byTs = new Map();
+  for (const snap of windowResults.flat()) {
+    byTs.set(snap.timestamp, snap);
   }
-  snapshots.sort((a, b) => a.timestamp - b.timestamp);
-  console.log(`✅ Tier heartbeats: ${snapshots.length} snapshots with max balance`);
+  const snapshots = [...byTs.values()].sort((a, b) => a.timestamp - b.timestamp);
+  console.log(`✅ Tier heartbeats: ${snapshots.length} snapshots (${windows.length} windows, concurrency ${fetchConcurrency()})`);
   return snapshots;
 }
 
@@ -561,54 +740,20 @@ async function fetchMessagesInRange(client, rangeStartMs, rangeEndMs, channelId 
     throw new Error(`Channel ${channelId} not found`);
   }
 
-  const events = [];
-  const cutoffTime = rangeStartMs;
   const parseFn = channelId === TRADE_SUCCESS_CHANNEL_ID ? parseTradeMessage : parseMarketFeedMessage;
+  const rangeLabel = `${new Date(rangeStartMs).toISOString().slice(0, 10)}..${new Date(rangeEndMs).toISOString().slice(0, 10)}`;
+  const windowMs = fetchWindowMs();
+  const windows = splitRangeIntoWindows(rangeStartMs, rangeEndMs, windowMs);
+  const concurrency = fetchConcurrency();
 
-  const rangeLabel = `${new Date(rangeStartMs).toISOString().slice(0,10)}..${new Date(rangeEndMs).toISOString().slice(0,10)}`;
-  console.log(`📥 Fetching messages from channel ${channelId} (${rangeLabel})...`);
+  console.log(`📥 Fetching messages from channel ${channelId} (${rangeLabel}, ${windows.length} parallel windows)...`);
 
-  let lastMessageId = null;
-  let fetchedCount = 0;
-  let hasMore = true;
+  const windowResults = await asyncPool(concurrency, windows, (win) =>
+    fetchChannelWindow(channel, win.startMs, win.endMs, parseFn)
+  );
+  const events = dedupeParsedEvents(windowResults.flat());
 
-  while (hasMore) {
-    const options = { limit: 100 };
-    if (lastMessageId) {
-      options.before = lastMessageId;
-    }
-
-    const messages = await channel.messages.fetch(options);
-    fetchedCount += messages.size;
-
-    if (messages.size === 0) {
-      hasMore = false;
-      break;
-    }
-
-    for (const message of messages.values()) {
-      if (message.createdTimestamp < cutoffTime) {
-        hasMore = false;
-        break;
-      }
-      // Skip messages newer than range end (only relevant when range ends before now)
-      if (message.createdTimestamp > rangeEndMs) continue;
-      const event = parseFn(message);
-      if (event) {
-        events.push(event);
-      }
-    }
-
-    if (messages.size < 100) {
-      hasMore = false;
-    } else {
-      lastMessageId = messages.last().id;
-    }
-
-    console.log(`   Fetched ${fetchedCount} messages, found ${events.length} events...`);
-  }
-
-  console.log(`✅ Found ${events.length} total events`);
+  console.log(`✅ Found ${events.length} total events (${windows.length} windows, concurrency ${concurrency})`);
   return events;
 }
 
@@ -2897,19 +3042,24 @@ async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient) {
     if (missedDays.length > 0) {
       const missedStartMs = dateStringToRange(missedDays[0]).startMs;
       const missedEndMs   = dateStringToRange(missedDays[missedDays.length - 1]).endMs;
-      const missedDaysBack = missedDays.length;
       const c = await getClient();
       const prefetch = await getDiscordPrefetch(c);
+      const perDayConcurrency = Math.max(6, Math.floor(fetchConcurrency() / missedDays.length));
 
-      // Fetch trade-success, create-trades and heartbeats for missed range all in parallel
-      const [fetchedEvents, fetchedAllCreateTrades, fetchedHeartbeats] = await Promise.all([
-        fetchMessagesInRange(c, missedStartMs, missedEndMs, TRADE_SUCCESS_CHANNEL_ID, prefetch),
-        fetchMessagesInRange(c, missedStartMs, missedEndMs, CREATE_TRADES_CHANNEL_ID, prefetch),
-        fetchSnipesHeartbeatSnapshots(c, missedDaysBack, prefetch).catch(err => {
-          console.warn('⚠️ Heartbeats unavailable:', err.message || err);
-          return [];
-        })
-      ]);
+      const rangeResults = await Promise.all(missedDays.map(async (day) => {
+        const { startMs, endMs } = dateStringToRange(day);
+        return fetchDiscordRangeParallel(prefetch, startMs, endMs, perDayConcurrency);
+      }));
+
+      const fetchedEvents = dedupeParsedEvents(rangeResults.flatMap((r) => r.events));
+      const fetchedAllCreateTrades = dedupeParsedEvents(rangeResults.flatMap((r) => r.allCreateTrades));
+      const hbByTs = new Map();
+      for (const r of rangeResults) {
+        for (const snap of r.heartbeats) hbByTs.set(snap.timestamp, snap);
+      }
+      const fetchedHeartbeats = [...hbByTs.values()].sort((a, b) => a.timestamp - b.timestamp);
+
+      console.log(`✅ Parallel fetch done: ${fetchedEvents.length} trades, ${fetchedAllCreateTrades.length} create-trades, ${fetchedHeartbeats.length} heartbeats (${missedDays.length} day(s))`);
 
       // Watermarks for past days (needed for cache upsert)
       if (allPast && supabaseClient) {
