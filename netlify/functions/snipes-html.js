@@ -3,6 +3,22 @@
 const { getHtmlForDateRange } = require('./lib/snipesCore.cjs');
 const { createSupabaseClient, todayUTC } = require('./lib/snipesCache.cjs');
 
+/** Coalesce concurrent identical range requests (avoids duplicate Discord backfills). */
+const inflightRequests = new Map();
+
+function getHtmlForDateRangeDeduped(startDateStr, endDateStr, supabase) {
+  const key = `${startDateStr}|${endDateStr}`;
+  if (inflightRequests.has(key)) {
+    console.log(`[snipes-html] coalescing in-flight request ${key}`);
+    return inflightRequests.get(key);
+  }
+  const promise = getHtmlForDateRange(startDateStr, endDateStr, supabase).finally(() => {
+    inflightRequests.delete(key);
+  });
+  inflightRequests.set(key, promise);
+  return promise;
+}
+
 /** Validate a YYYY-MM-DD string; return true if well-formed. */
 function isValidDate(s) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
@@ -61,7 +77,7 @@ exports.handler = async (event) => {
     }
 
     const supabase = createSupabaseClient();
-    const { html, cacheHit } = await getHtmlForDateRange(startDateStr, endDateStr, supabase);
+    const { html, cacheHit } = await getHtmlForDateRangeDeduped(startDateStr, endDateStr, supabase);
 
     return {
       statusCode: 200,

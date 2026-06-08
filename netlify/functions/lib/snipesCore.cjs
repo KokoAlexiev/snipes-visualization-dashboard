@@ -49,7 +49,7 @@ function parsePriceFromMarketFeed(event) {
   return Number.isFinite(num) ? num : null;
 }
 
-/** Min/max price (USD) for "missed" — items outside this range are not counted as missed (e.g. knives > 1200). */
+/** Min/max price for "missed" chart band only. Not-eligible (price > tier cap) is computed before this filter so high listings still count. */
 const MISSED_PRICE_MIN = 30;
 const MISSED_PRICE_MAX = 1200;
 
@@ -424,9 +424,16 @@ function maxBalanceUsdAtTime(sortedSnapshots, timeMs) {
 /**
  * Fetch tier heartbeats from Snipes console for max-balance time series.
  */
-async function fetchSnipesHeartbeatSnapshots(client, daysBack = 7) {
-  const guild = await client.guilds.fetch(GUILD_ID);
-  const channel = await guild.channels.fetch(SNIPES_CONSOLE_CHANNEL_ID);
+async function fetchSnipesHeartbeatSnapshots(client, daysBack = 7, prefetch = null) {
+  let channel;
+  if (prefetch && prefetch.channels && prefetch.channels[SNIPES_CONSOLE_CHANNEL_ID]) {
+    channel = prefetch.channels[SNIPES_CONSOLE_CHANNEL_ID];
+  } else {
+    const guild = prefetch && prefetch.guild
+      ? prefetch.guild
+      : await client.guilds.fetch(GUILD_ID);
+    channel = await guild.channels.fetch(SNIPES_CONSOLE_CHANNEL_ID);
+  }
   if (!channel) {
     throw new Error(`Channel ${SNIPES_CONSOLE_CHANNEL_ID} not found`);
   }
@@ -539,9 +546,16 @@ async function fetchMessages(client, daysBack = 7, channelId = CHANNEL_ID) {
  * Pagination stops when we go older than rangeStartMs.
  * Returns an array of parsed event objects.
  */
-async function fetchMessagesInRange(client, rangeStartMs, rangeEndMs, channelId = CHANNEL_ID) {
-  const guild = await client.guilds.fetch(GUILD_ID);
-  const channel = await guild.channels.fetch(channelId);
+async function fetchMessagesInRange(client, rangeStartMs, rangeEndMs, channelId = CHANNEL_ID, prefetch = null) {
+  let channel;
+  if (prefetch && prefetch.channels && prefetch.channels[channelId]) {
+    channel = prefetch.channels[channelId];
+  } else {
+    const guild = prefetch && prefetch.guild
+      ? prefetch.guild
+      : await client.guilds.fetch(GUILD_ID);
+    channel = await guild.channels.fetch(channelId);
+  }
 
   if (!channel) {
     throw new Error(`Channel ${channelId} not found`);
@@ -2798,8 +2812,7 @@ async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient) {
 
   let wmTradeSuccess = '', wmCreateTrades = '';
 
-  // For today's watermark check we need Discord — but only if today is in range
-  // We defer the client login until we know we need it.
+  // We defer Discord login until cache lookup proves we need it.
   let client = null;
 
   async function getClient() {
@@ -2812,62 +2825,87 @@ async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient) {
     return client;
   }
 
-  try {
-    // If today is in range, fetch watermarks (needed to check today's cache freshness)
-    if (todayInRange && supabaseClient) {
-      const c = await getClient();
-      const guild = await c.guilds.fetch(GUILD_ID);
-      const [tsChan, ctChan] = await Promise.all([
-        guild.channels.fetch(TRADE_SUCCESS_CHANNEL_ID),
-        guild.channels.fetch(CREATE_TRADES_CHANNEL_ID)
-      ]);
-      [wmTradeSuccess, wmCreateTrades] = await Promise.all([
-        getChannelWatermark(tsChan),
-        getChannelWatermark(ctChan)
-      ]);
-    }
+  async function getDiscordPrefetch(c) {
+    const guild = await c.guilds.fetch(GUILD_ID);
+    const [tsChan, ctChan, hbChan] = await Promise.all([
+      guild.channels.fetch(TRADE_SUCCESS_CHANNEL_ID),
+      guild.channels.fetch(CREATE_TRADES_CHANNEL_ID),
+      guild.channels.fetch(SNIPES_CONSOLE_CHANNEL_ID)
+    ]);
+    return {
+      guild,
+      channels: {
+        [TRADE_SUCCESS_CHANNEL_ID]: tsChan,
+        [CREATE_TRADES_CHANNEL_ID]: ctChan,
+        [SNIPES_CONSOLE_CHANNEL_ID]: hbChan
+      }
+    };
+  }
 
-    // Check per-day cache in parallel (all Supabase reads at once)
+  try {
+    // --- Step 1: Supabase cache only (no Discord yet) ---
     const cacheResults = supabaseClient
       ? await Promise.all(days.map(d => loadCache(supabaseClient, d, d)))
       : days.map(() => null);
+
+    const todayPending = [];
 
     for (let i = 0; i < days.length; i++) {
       const day = days[i];
       const cached = cacheResults[i];
       if (cached && cached.payload) {
-        const dayIsPast = isFullyInPast(day);
-        const isHit = dayIsPast || (
-          day === today &&
-          cached.watermarkTradeSuccess === wmTradeSuccess &&
-          cached.watermarkCreateTrades === wmCreateTrades
-        );
-        if (isHit) {
-          console.log(`[cache] HIT day ${day}`);
+        if (isFullyInPast(day)) {
+          console.log(`[cache] HIT day ${day} (past)`);
           dayData[day] = cached.payload;
           continue;
         }
-        console.log(`[cache] STALE day ${day}`);
-      } else {
-        console.log(`[cache] MISS day ${day}`);
+        if (day === today) {
+          todayPending.push(cached);
+          continue;
+        }
       }
+      console.log(`[cache] MISS day ${day}`);
       missedDays.push(day);
+    }
+
+    // --- Step 2: validate today's row with Discord watermarks (only if cached) ---
+    if (todayPending.length > 0) {
+      if (supabaseClient) {
+        const c = await getClient();
+        const prefetch = await getDiscordPrefetch(c);
+        [wmTradeSuccess, wmCreateTrades] = await Promise.all([
+          getChannelWatermark(prefetch.channels[TRADE_SUCCESS_CHANNEL_ID]),
+          getChannelWatermark(prefetch.channels[CREATE_TRADES_CHANNEL_ID])
+        ]);
+        const cached = todayPending[0];
+        if (cached.watermarkTradeSuccess === wmTradeSuccess &&
+            cached.watermarkCreateTrades === wmCreateTrades) {
+          console.log(`[cache] HIT day ${today} (today, fresh)`);
+          dayData[today] = cached.payload;
+        } else {
+          console.log(`[cache] STALE day ${today}`);
+          if (!missedDays.includes(today)) missedDays.push(today);
+        }
+      } else if (!missedDays.includes(today)) {
+        missedDays.push(today);
+      }
     }
 
     const fullCacheHit = missedDays.length === 0;
 
-    // --- Step 2: fetch Discord only for missed days ---
+    // --- Step 3: fetch Discord only for missed days ---
     if (missedDays.length > 0) {
       const missedStartMs = dateStringToRange(missedDays[0]).startMs;
       const missedEndMs   = dateStringToRange(missedDays[missedDays.length - 1]).endMs;
       const missedDaysBack = missedDays.length;
       const c = await getClient();
+      const prefetch = await getDiscordPrefetch(c);
 
       // Fetch trade-success, create-trades and heartbeats for missed range all in parallel
       const [fetchedEvents, fetchedAllCreateTrades, fetchedHeartbeats] = await Promise.all([
-        fetchMessagesInRange(c, missedStartMs, missedEndMs, TRADE_SUCCESS_CHANNEL_ID),
-        fetchMessagesInRange(c, missedStartMs, missedEndMs, CREATE_TRADES_CHANNEL_ID),
-        fetchSnipesHeartbeatSnapshots(c, missedDaysBack).catch(err => {
+        fetchMessagesInRange(c, missedStartMs, missedEndMs, TRADE_SUCCESS_CHANNEL_ID, prefetch),
+        fetchMessagesInRange(c, missedStartMs, missedEndMs, CREATE_TRADES_CHANNEL_ID, prefetch),
+        fetchSnipesHeartbeatSnapshots(c, missedDaysBack, prefetch).catch(err => {
           console.warn('⚠️ Heartbeats unavailable:', err.message || err);
           return [];
         })
@@ -2876,16 +2914,16 @@ async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient) {
       // Watermarks for past days (needed for cache upsert)
       if (allPast && supabaseClient) {
         try {
-          const guild = await c.guilds.fetch(GUILD_ID);
-          const [tsChan, ctChan] = await Promise.all([
-            guild.channels.fetch(TRADE_SUCCESS_CHANNEL_ID),
-            guild.channels.fetch(CREATE_TRADES_CHANNEL_ID)
-          ]);
           [wmTradeSuccess, wmCreateTrades] = await Promise.all([
-            getChannelWatermark(tsChan),
-            getChannelWatermark(ctChan)
+            getChannelWatermark(prefetch.channels[TRADE_SUCCESS_CHANNEL_ID]),
+            getChannelWatermark(prefetch.channels[CREATE_TRADES_CHANNEL_ID])
           ]);
         } catch (_) {}
+      } else if (todayInRange && supabaseClient && !wmTradeSuccess && !wmCreateTrades) {
+        [wmTradeSuccess, wmCreateTrades] = await Promise.all([
+          getChannelWatermark(prefetch.channels[TRADE_SUCCESS_CHANNEL_ID]),
+          getChannelWatermark(prefetch.channels[CREATE_TRADES_CHANNEL_ID])
+        ]);
       }
 
       // Split fetched data by day, cache each missed day individually
@@ -2930,21 +2968,22 @@ async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient) {
     // --- Step 5: compute missed / ineligible / blacklist ---
     const marketFeedUnder3 = filterCreateTradesMarkupAtMost3(allCreateTrades);
     const gotIds = new Set(allEvents.map(e => (e.tradeId || '').trim()).filter(Boolean));
-    const candidateMissed = marketFeedUnder3.filter(e => {
+    const candidatePool = marketFeedUnder3.filter(e => {
       const tid = (e.tradeId || '').trim();
       if (gotIds.has(tid)) return false;
       if (isBlacklisted(e)) return false;
-      const price = parsePriceFromMarketFeed(e);
-      if (price != null && (price < MISSED_PRICE_MIN || price > MISSED_PRICE_MAX)) return false;
       return true;
     });
     const missedSnipes = [], ineligibleSnipes = [], supabaseBlacklistSnipes = [];
-    for (const e of candidateMissed) {
+    for (const e of candidatePool) {
       if (isSupabaseItemBlacklisted(e, supabaseBlacklistNameSet)) { supabaseBlacklistSnipes.push(e); continue; }
       const price = parsePriceFromMarketFeed(e);
       const cap = maxBalanceUsdAtTime(hbSorted, e.timestamp);
-      if (cap != null && price != null && price > cap) ineligibleSnipes.push(e);
-      else missedSnipes.push(e);
+      if (cap != null && price != null && price > cap) {
+        ineligibleSnipes.push(e);
+        continue;
+      }
+      if (price != null && price >= MISSED_PRICE_MIN && price <= MISSED_PRICE_MAX) missedSnipes.push(e);
     }
     console.log(`📉 Missed: ${missedSnipes.length} + Blacklist: ${supabaseBlacklistSnipes.length} + NotEligible: ${ineligibleSnipes.length} (cacheHit=${fullCacheHit})`);
 

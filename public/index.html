@@ -238,6 +238,18 @@
       }
 
       var debounceId = null;
+      var loadGeneration = 0;
+
+      function extractErrorMessage(html, status) {
+        if (!html) return 'Server error (' + status + ')';
+        try {
+          var doc = new DOMParser().parseFromString(html, 'text/html');
+          var p = doc.querySelector('body p');
+          if (p && p.textContent) return p.textContent.trim();
+        } catch (_) {}
+        return 'Server error (' + status + ')';
+      }
+
       function doLoad() {
         if (debounceId) clearTimeout(debounceId);
         var start = startInput.value;
@@ -245,6 +257,7 @@
         var err   = validate(start, end);
         if (err) { showError(err); return; }
         showError('');
+        var generation = ++loadGeneration;
         setLoading(true, start, end);
 
         var url = '/.netlify/functions/snipes-html?start=' + encodeURIComponent(start) +
@@ -253,17 +266,30 @@
         // Use fetch so we can inspect X-Snipes-Cache header, then inject via srcdoc
         fetch(url)
           .then(function (res) {
+            if (generation !== loadGeneration) return null;
             var hit = res.headers.get('X-Snipes-Cache');
             cacheBadge.className = 'cache-badge ' + (hit === 'HIT' ? 'hit' : 'miss');
             cacheBadge.textContent = hit === 'HIT' ? 'Cached' : 'Live fetch';
-            return res.text();
+            return res.text().then(function (html) {
+              return { ok: res.ok, status: res.status, html: html };
+            });
           })
-          .then(function (html) {
+          .then(function (payload) {
+            if (!payload || generation !== loadGeneration) return;
+            if (!payload.ok) {
+              setLoading(false);
+              dash.removeAttribute('srcdoc');
+              showError(extractErrorMessage(payload.html, payload.status));
+              return;
+            }
             dash.onload = function () { setLoading(false); };
             dash.onerror = function () { setLoading(false); };
-            dash.srcdoc = html;
+            dash.srcdoc = payload.html;
+            // srcdoc iframes often never fire onload; hide overlay once HTML is injected
+            requestAnimationFrame(function () { setLoading(false); });
           })
           .catch(function (fetchErr) {
+            if (generation !== loadGeneration) return;
             setLoading(false);
             showError('Fetch failed: ' + (fetchErr && fetchErr.message));
           });
@@ -279,10 +305,10 @@
       startInput.addEventListener('change', scheduleLoad);
       endInput.addEventListener('change', scheduleLoad);
 
-      /* Set defaults: start = yesterday UTC, end = today UTC (≈ last 24h as calendar window) */
+      /* Default to today only so the first load stays within Netlify function timeout */
       var today = todayUTC();
       endInput.value   = today;
-      startInput.value = offsetDate(today, 1);
+      startInput.value = today;
 
       /* Cap max date to today */
       startInput.max = today;

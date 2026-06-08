@@ -56,7 +56,7 @@ function parsePriceFromMarketFeed(event) {
   return Number.isFinite(num) ? num : null;
 }
 
-/** Min/max price (USD) for "missed" — items outside this range are not counted as missed (e.g. knives > 1200). */
+/** Min/max price for "missed" chart band only; not-eligible uses tier cap before this filter. */
 const MISSED_PRICE_MIN = 30;
 const MISSED_PRICE_MAX = 1200;
 
@@ -2826,12 +2826,10 @@ async function main() {
     // Fetch create-trades and keep only markup ≤ CREATE_TRADES_MARKUP_MAX_PCT (2%)
     const { under3: marketFeedUnder3, all: allCreateTrades } = await fetchMarketFeedUnder3(client, daysBack);
     const gotIds = new Set(events.map((e) => (e.tradeId || '').trim()).filter(Boolean));
-    const candidateMissed = marketFeedUnder3.filter((e) => {
+    const candidatePool = marketFeedUnder3.filter((e) => {
       const tid = (e.tradeId || '').trim();
       if (gotIds.has(tid)) return false;
       if (isBlacklisted(e)) return false;
-      const price = parsePriceFromMarketFeed(e);
-      if (price != null && (price < MISSED_PRICE_MIN || price > MISSED_PRICE_MAX)) return false;
       return true;
     });
     let supabaseBlacklistNameSet = new Set();
@@ -2857,20 +2855,25 @@ async function main() {
     const missedSnipes = [];
     const ineligibleSnipes = [];
     const supabaseBlacklistSnipes = [];
-    for (const e of candidateMissed) {
+    for (const e of candidatePool) {
       if (isSupabaseItemBlacklisted(e, supabaseBlacklistNameSet)) {
         supabaseBlacklistSnipes.push(e);
         continue;
       }
       const price = parsePriceFromMarketFeed(e);
       const cap = maxBalanceUsdAtTime(hbSorted, e.timestamp);
-      if (cap != null && price != null && price > cap) ineligibleSnipes.push(e);
-      else missedSnipes.push(e);
+      if (cap != null && price != null && price > cap) {
+        ineligibleSnipes.push(e);
+        continue;
+      }
+      if (price != null && price >= MISSED_PRICE_MIN && price <= MISSED_PRICE_MAX) missedSnipes.push(e);
     }
     const blacklistedCount = marketFeedUnder3.filter((e) => !gotIds.has((e.tradeId || '').trim()) && isBlacklisted(e)).length;
-    const outOfRangeCount = marketFeedUnder3.filter((e) => {
-      if (gotIds.has((e.tradeId || '').trim()) || isBlacklisted(e)) return false;
+    const outOfRangeCount = candidatePool.filter((e) => {
+      if (isSupabaseItemBlacklisted(e, supabaseBlacklistNameSet)) return false;
       const price = parsePriceFromMarketFeed(e);
+      const cap = maxBalanceUsdAtTime(hbSorted, e.timestamp);
+      if (cap != null && price != null && price > cap) return false;
       return price != null && (price < MISSED_PRICE_MIN || price > MISSED_PRICE_MAX);
     }).length;
     console.log(`\n📉 Missed (eligible) + Supabase blacklist + not eligible: ${missedSnipes.length} + ${supabaseBlacklistSnipes.length} + ${ineligibleSnipes.length} (create-trades ≤${CREATE_TRADES_MARKUP_MAX_PCT}%, not got, not hardcoded-blacklisted, price ${MISSED_PRICE_MIN}–${MISSED_PRICE_MAX})`);
