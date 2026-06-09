@@ -175,6 +175,7 @@ function parseTradeMessage(message) {
     zone: null,
     wsHost: null,
     wsBackend: null,
+    wsPath: null,
     postHost: null,
     postBackend: null,
     postHostname: null
@@ -317,6 +318,12 @@ function parseTradeMessage(message) {
   const wsBackendMatch = content.match(/🌐 WS Backend\s+([^\n]+)/) || content.match(/WS Backend\s+([^\n]+)/i);
   if (wsBackendMatch) {
     event.wsBackend = wsBackendMatch[1].trim();
+  }
+
+  // Extract WS Path
+  const wsPathMatch = content.match(/🛤️ WS Path\s+([^\n]+)/);
+  if (wsPathMatch) {
+    event.wsPath = wsPathMatch[1].trim();
   }
 
   // Extract POST Hostname, POST Backend, and keep postHost for display (first available)
@@ -1844,6 +1851,7 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
                         <th class="sortable" data-sort="markup">Markup</th>
                         <th class="sortable" data-sort="session">Session</th>
                         <th class="sortable" data-sort="hostvm">Host VM</th>
+                        <th class="sortable" data-sort="wsPath">WS Path</th>
                         <th>Trade ID</th>
                         <th>WS Winner</th>
                     </tr>
@@ -2813,6 +2821,7 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
           hostvm: e.hostVM || 'N/A',
           tradeId: e.tradeId || 'N/A',
           wsWinner: e.wsWinner || 'N/A',
+          wsPath: e.wsPath || 'N/A',
           region: e.region || 'N/A',
           zone: e.zone || 'N/A',
           wsHost: e.wsHost || 'N/A',
@@ -2839,6 +2848,7 @@ function generateHTML(events, daysBack, missedSnipes = [], options = {}) {
               '<td>' + event.markup + '</td>' +
               '<td>' + event.session + '</td>' +
               '<td>' + event.hostvm + '</td>' +
+              '<td>' + event.wsPath + '</td>' +
               '<td>' + event.tradeId + '</td>' +
               '<td style="max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="' + event.wsWinner + '">' + event.wsWinner + '</td>' +
               '</tr>';
