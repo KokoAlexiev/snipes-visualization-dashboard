@@ -3004,11 +3004,19 @@ async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient, opt
 
       if (cached && cached.payload) {
         if (isFullyInPast(day)) {
-          console.log(`[cache] HIT day ${day} (past)`);
-          dayData[day] = cached.payload;
-          continue;
-        }
-        if (isToday) {
+          // A past day is only complete if its cache row was built AFTER the day
+          // ended. Rows built while the day was still "today" froze with partial
+          // data when the UTC day rolled over — rebuild those exactly once.
+          const dayEndMs = dateStringToRange(day).endMs;
+          const builtMs = cached.builtAt ? Date.parse(cached.builtAt) : 0;
+          if (builtMs > dayEndMs) {
+            console.log(`[cache] HIT day ${day} (past, complete)`);
+            dayData[day] = cached.payload;
+            continue;
+          }
+          console.log(`[cache] REBUILD day ${day} (past but cache built before day ended)`);
+          // fall through to rebuild
+        } else if (isToday) {
           if (opts.forceToday) {
             // Background refresh path: rebuild today from Discord
             console.log(`[cache] FORCE rebuild day ${day} (today)`);
