@@ -269,6 +269,8 @@ function parseTradeMessage(message) {
   const markupMatch = content.match(/📈 Markup\s+([^\n]+)/);
   if (markupMatch) {
     event.markup = markupMatch[1].trim();
+    const mNum = event.markup.match(/([-+]?\d*\.?\d+)/);
+    if (mNum) event.markupPct = parseFloat(mNum[1]);
   }
   
   // Extract Total Value / Value
@@ -3124,7 +3126,11 @@ async function getHtmlForDateRange(startDateStr, endDateStr, supabaseClient, opt
     }
 
     // --- Step 3: combine all days ---
-    const allEvents       = days.flatMap(d => (dayData[d] && dayData[d].events)       || []);
+    // Only include got-snipes with ≤2% markup (same threshold as create-trades candidate pool).
+    const allEvents = days.flatMap(d => (dayData[d] && dayData[d].events) || []).filter(e => {
+      const pct = e.markupPct;
+      return pct == null || pct <= CREATE_TRADES_MARKUP_MAX_PCT;
+    });
     const allCreateTrades = days.flatMap(d => (dayData[d] && dayData[d].allCreateTrades) || []);
     const allHeartbeats   = days.flatMap(d => (dayData[d] && dayData[d].heartbeatSnapshots) || []);
     const hbSorted = [...allHeartbeats].sort((a, b) => a.timestamp - b.timestamp);
